@@ -1,0 +1,26 @@
+# Small B2 experiment: frozen Qwen backbone + learned generative-memory control.
+# This validates the generator/reader/injection path independently of a trained
+# Engram artifact.  Switch generator_cue_source to "engram" and provide
+# source-memory/memory-config to run the full hippocampus-to-cortex transfer.
+adaptor_training:
+  target_model: Qwen/Qwen3.5-0.8B-Base
+  condition: transferred
+  architecture: generative
+  generator_cue_source: learned
+  reader_type: cross_attention
+  memory_dim: 512
+  generator_num_latents: 4
+  generator_hidden_size: 256
+  generator_layers: 2
+  generator_heads: 4
+  generator_cue_window: 3
+  max_tokens: 1000000
+  seq_len: 256
+  batch_size: 4
+  grad_accum_steps: 4
+  lr: 3.0e-5
+  warmup_steps: 20
+  eval_every: 100
+  log_every: 10
+  corpus: wikitext
+  skip_final_test_eval: true

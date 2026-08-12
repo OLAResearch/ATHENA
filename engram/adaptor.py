@@ -243,6 +243,14 @@ def build_adaptor(
     d_mem: int,
     gate_bias_init: float = 0.0,
     num_branches: int = 1,
+    architecture: str = "legacy",
+    reader_type: str = "cross_attention",
+    generator_cue_source: str = "engram",
+    generator_num_latents: int = 4,
+    generator_hidden_size: int = 256,
+    generator_layers: int = 2,
+    generator_heads: int = 4,
+    generator_cue_window: int = 3,
 ) -> nn.Module:
     """Factory function for adaptor variants.
 
@@ -255,6 +263,27 @@ def build_adaptor(
     Returns:
         Adaptor module
     """
+    if architecture not in ("legacy", "generative"):
+        raise ValueError(f"Unknown architecture: {architecture}")
+    if condition == "baseline":
+        return None
+    if architecture == "generative" and condition not in ("ffn_only", "memory_only"):
+        # Local import avoids a module-level cycle because generative_memory
+        # reuses RMSNorm from this module.
+        from .generative_memory import GenerativeMemoryAdaptor
+
+        return GenerativeMemoryAdaptor(
+            d_model=d_model,
+            d_mem=d_mem,
+            reader_type=reader_type,
+            cue_source=generator_cue_source,
+            num_latents=generator_num_latents,
+            hidden_size=generator_hidden_size,
+            num_layers=generator_layers,
+            num_heads=generator_heads,
+            cue_window=generator_cue_window,
+            gate_bias_init=gate_bias_init,
+        )
     if condition in ("transferred", "random_memory", "permuted_keys", "train_from_scratch"):
         if num_branches > 1:
             return MultiBranchEngramAdaptor(
@@ -274,7 +303,5 @@ def build_adaptor(
         # Target params: ~same as full EngramAdaptor
         target = 2 * d_mem * d_model + 2 * d_model  # W_K + W_V + norms
         return FFNOnlyAdaptor(d_model=d_model, target_param_count=target)
-    elif condition == "baseline":
-        return None  # No adaptor for baseline
     else:
         raise ValueError(f"Unknown condition: {condition}")

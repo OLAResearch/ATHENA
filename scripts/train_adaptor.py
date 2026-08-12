@@ -73,6 +73,16 @@ def parse_args():
                         help="Comma-separated layer indices for memory injection")
     parser.add_argument("--adaptor-branches", type=int, default=1,
                         help="Number of branch-specific key/gating paths in the adaptor")
+    parser.add_argument("--architecture", choices=["legacy", "generative"], default="legacy")
+    parser.add_argument("--reader-type", choices=["cross_attention", "mean"], default="cross_attention")
+    parser.add_argument("--generator-cue-source", choices=["engram", "learned"], default="engram")
+    parser.add_argument("--generator-num-latents", type=int, default=4)
+    parser.add_argument("--generator-hidden-size", type=int, default=256)
+    parser.add_argument("--generator-layers", type=int, default=2)
+    parser.add_argument("--generator-heads", type=int, default=4)
+    parser.add_argument("--generator-cue-window", type=int, default=3)
+    parser.add_argument("--memory-dim", type=int, default=None,
+                        help="Memory/cue dimension for generative learned controls")
     # Cross-tokenizer mode
     parser.add_argument("--canon-mode", type=str, default="vocab",
                         choices=["vocab", "word_boundary"])
@@ -120,14 +130,30 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def parse_injection_layers(raw: str | None) -> list[int] | None:
-    if raw is None or raw.strip() == "":
+def parse_injection_layers(raw) -> list[int] | None:
+    if raw is None:
         return None
-    return [int(part.strip()) for part in re.split(r"[\s,:;]+", raw) if part.strip()]
+    if isinstance(raw, (list, tuple)):
+        return [int(value) for value in raw]
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    return [
+        int(part.strip())
+        for part in re.split(r"[\s,:;]+", raw)
+        if part.strip()
+    ]
 
 
 def setup_memory(args, device) -> tuple:
     """Set up memory based on condition."""
+    # Learned generative cues are an explicit capacity control.  Keep this
+    # branch independent of all Engram files and lookup machinery.
+    if args.architecture == "generative" and args.generator_cue_source == "learned":
+        if args.memory_dim is None:
+            raise ValueError("--memory-dim is required for generative learned cue source")
+        return None, None, int(args.memory_dim)
+
     # Load memory config
     with open(args.memory_config) as f:
         mem_cfg_dict = json.load(f)
@@ -153,10 +179,10 @@ def setup_memory(args, device) -> tuple:
     condition = args.condition
 
     if condition == "baseline":
-        return None, mem_cfg
+        return None, mem_cfg, mem_cfg.d_mem
 
     if condition == "ffn_only":
-        return None, mem_cfg
+        return None, mem_cfg, mem_cfg.d_mem
 
     # Create memory module
     memory = EngramMemory(mem_cfg)
@@ -189,7 +215,7 @@ def setup_memory(args, device) -> tuple:
         for p in memory.parameters():
             p.requires_grad = False
 
-    return memory, mem_cfg
+    return memory, mem_cfg, mem_cfg.d_mem
 
 
 def main():
@@ -198,10 +224,6 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save config
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -220,7 +242,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Setup memory
-    memory, mem_cfg = setup_memory(args, device)
+    memory, mem_cfg, memory_dim = setup_memory(args, device)
+    args.memory_dim = memory_dim
+
+    # Save the complete runtime configuration after resolving memory_dim.
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
 
     # Build wrapper
     wrapper = BackboneWrapper(
@@ -231,6 +258,15 @@ def main():
         dtype=dtype,
         injection_layers=parse_injection_layers(args.injection_layers),
         adaptor_branches=args.adaptor_branches,
+        memory_dim=memory_dim,
+        architecture=args.architecture,
+        reader_type=args.reader_type,
+        generator_cue_source=args.generator_cue_source,
+        generator_num_latents=args.generator_num_latents,
+        generator_hidden_size=args.generator_hidden_size,
+        generator_layers=args.generator_layers,
+        generator_heads=args.generator_heads,
+        generator_cue_window=args.generator_cue_window,
     )
 
     if args.init_adaptor is not None:
@@ -260,16 +296,18 @@ def main():
     elif memory is not None:
         wrapper.freeze_memory()
 
-    # Build canonicalizer
-    canonicalizer = build_canonicalizer(tokenizer, mode=args.canon_mode, max_ngram=mem_cfg.max_ngram)
+    # Build canonicalization only when an Engram memory is actually present.
+    canonicalizer = None
+    if memory is not None:
+        canonicalizer = build_canonicalizer(tokenizer, mode=args.canon_mode, max_ngram=mem_cfg.max_ngram)
 
     # For vocab mode, build ID map; for word_boundary mode, build hasher
     canon_id_map = None
     word_boundary_canon = None
     word_ngram_hasher = None
-    if args.canon_mode == "vocab" and hasattr(canonicalizer, "build_id_map"):
+    if canonicalizer is not None and args.canon_mode == "vocab" and hasattr(canonicalizer, "build_id_map"):
         canon_id_map = canonicalizer.build_id_map(tokenizer).to(device)
-    elif args.canon_mode == "word_boundary" and isinstance(canonicalizer, WordBoundaryCanonicalizer):
+    elif canonicalizer is not None and args.canon_mode == "word_boundary" and isinstance(canonicalizer, WordBoundaryCanonicalizer):
         word_boundary_canon = canonicalizer
         word_ngram_hasher = WordNgramHasher(mem_cfg.hash_config)
 

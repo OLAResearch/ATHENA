@@ -139,7 +139,12 @@ def main():
     if not torch.cuda.is_available():
         dtype = torch.float32
     elif args.freeze_backbone:
-        dtype = torch.float16  # FP16 safe when backbone is frozen (no backbone gradients)
+        # The frozen backbone still feeds gradients through the hook into the
+        # trainable Engram/adaptor.  FP16 can therefore overflow/underflow in
+        # that path (and did on GH200).  Use BF16 on modern accelerators for
+        # its FP32-sized exponent range; retain FP16 only as a legacy fallback.
+        cap = torch.cuda.get_device_capability()
+        dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
     else:
         # BF16 has same 8-bit exponent range as FP32 (no gradient underflow),
         # unlike FP16 which has 5-bit exponent. Safe for end-to-end training.

@@ -28,12 +28,23 @@ class BackboneWrapper(nn.Module):
         gate_bias_init: float = 0.0,
         injection_layers: Optional[list[int]] = None,
         adaptor_branches: int = 1,
+        memory_dim: Optional[int] = None,
+        architecture: str = "legacy",
+        reader_type: str = "cross_attention",
+        generator_cue_source: str = "engram",
+        generator_num_latents: int = 4,
+        generator_hidden_size: int = 256,
+        generator_layers: int = 2,
+        generator_heads: int = 4,
+        generator_cue_window: int = 3,
     ):
         super().__init__()
         self.model_name = model_name
         self.condition = condition
         self.device = device
         self.adaptor_branches = adaptor_branches
+        self.architecture = architecture
+        self.generator_cue_source = generator_cue_source
 
         # Load backbone
         # Phi-4-mini's custom modeling code is incompatible with transformers 5.x;
@@ -57,14 +68,25 @@ class BackboneWrapper(nn.Module):
         if memory is not None:
             self.memory = memory.to(device)
 
-        d_mem = memory.d_mem if memory is not None else 0
+        d_mem = memory.d_mem if memory is not None else (memory_dim or 0)
+        adaptor_kwargs = dict(
+            gate_bias_init=gate_bias_init,
+            num_branches=adaptor_branches,
+            architecture=architecture,
+            reader_type=reader_type,
+            generator_cue_source=generator_cue_source,
+            generator_num_latents=generator_num_latents,
+            generator_hidden_size=generator_hidden_size,
+            generator_layers=generator_layers,
+            generator_heads=generator_heads,
+            generator_cue_window=generator_cue_window,
+        )
         if len(self.injection_layers) == 1:
             self.adaptor = build_adaptor(
                 condition,
                 self.d_model,
                 d_mem,
-                gate_bias_init=gate_bias_init,
-                num_branches=adaptor_branches,
+                **adaptor_kwargs,
             )
         else:
             self.adaptor = nn.ModuleList([
@@ -72,8 +94,7 @@ class BackboneWrapper(nn.Module):
                     condition,
                     self.d_model,
                     d_mem,
-                    gate_bias_init=gate_bias_init,
-                    num_branches=adaptor_branches,
+                    **adaptor_kwargs,
                 )
                 for _ in self.injection_layers
             ])
@@ -173,7 +194,14 @@ class BackboneWrapper(nn.Module):
                 # will be None. The FFNOnlyAdaptor ignores the mem argument,
                 # so we pass None through and let the adaptor handle it.
                 # For memory-based conditions, mem_vectors must exist.
-                if mem_vectors is None and self.condition not in ("ffn_only",):
+                allow_no_memory = (
+                    self.condition == "ffn_only"
+                    or (
+                        self.architecture == "generative"
+                        and self.generator_cue_source == "learned"
+                    )
+                )
+                if mem_vectors is None and not allow_no_memory:
                     return output
 
                 # Compute adaptor contribution

@@ -44,6 +44,27 @@ from engram.hashing import HashConfig, WordNgramHasher
 from engram.metrics import bootstrap_ci
 
 
+# These values describe the legacy transfer setup.  At evaluation time they
+# are overridden by the saved training config, then by explicit CLI arguments.
+RUNTIME_CONFIG_DEFAULTS = {
+    "condition": "transferred",
+    "architecture": "legacy",
+    "reader_type": "cross_attention",
+    "generator_cue_source": "engram",
+    "generator_num_latents": 4,
+    "generator_hidden_size": 256,
+    "generator_layers": 2,
+    "generator_heads": 4,
+    "generator_cue_window": 3,
+    "memory_dim": None,
+    "injection_layers": None,
+    "adaptor_branches": 1,
+    "canon_mode": "vocab",
+    "source_memory": "results/source_memory/memory.pt",
+    "memory_config": "results/source_memory/memory_config.json",
+}
+
+
 # ── Task Loaders ─────────────────────────────────────────────────────
 
 
@@ -471,8 +492,13 @@ def eval_lambada(
 # ── Model Setup ──────────────────────────────────────────────────────
 
 
-def parse_injection_layers(raw):
-    if raw is None or raw.strip() == "":
+def parse_injection_layers(raw) -> list[int] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        return [int(value) for value in raw]
+    raw = str(raw).strip()
+    if not raw:
         return None
     return [int(part.strip()) for part in re.split(r"[\s,:;]+", raw) if part.strip()]
 
@@ -486,6 +512,15 @@ def setup_wrapper(
     dtype: torch.dtype,
     injection_layers: Optional[list] = None,
     adaptor_branches: int = 1,
+    memory_dim: Optional[int] = None,
+    architecture: str = "legacy",
+    reader_type: str = "cross_attention",
+    generator_cue_source: str = "engram",
+    generator_num_latents: int = 4,
+    generator_hidden_size: int = 256,
+    generator_layers: int = 2,
+    generator_heads: int = 4,
+    generator_cue_window: int = 3,
 ) -> BackboneWrapper:
     """Create and configure a BackboneWrapper."""
     wrapper = BackboneWrapper(
@@ -496,11 +531,29 @@ def setup_wrapper(
         dtype=dtype,
         injection_layers=injection_layers,
         adaptor_branches=adaptor_branches,
+        memory_dim=memory_dim,
+        architecture=architecture,
+        reader_type=reader_type,
+        generator_cue_source=generator_cue_source,
+        generator_num_latents=generator_num_latents,
+        generator_hidden_size=generator_hidden_size,
+        generator_layers=generator_layers,
+        generator_heads=generator_heads,
+        generator_cue_window=generator_cue_window,
     )
 
     if adaptor_path and Path(adaptor_path).exists() and wrapper.adaptor is not None:
         state_dict = torch.load(adaptor_path, map_location="cpu", weights_only=True)
-        wrapper.adaptor.load_state_dict(state_dict)
+        if isinstance(wrapper.adaptor, torch.nn.ModuleList):
+            # A multi-layer checkpoint contains 0.*, 1.*, ... keys.  Older
+            # one-adaptor checkpoints are intentionally replicated here.
+            if any(key.split(".", 1)[0].isdigit() for key in state_dict):
+                wrapper.adaptor.load_state_dict(state_dict)
+            else:
+                for adaptor in wrapper.adaptor:
+                    adaptor.load_state_dict(state_dict)
+        else:
+            wrapper.adaptor.load_state_dict(state_dict)
         wrapper.adaptor.to(device)
 
     wrapper.eval()
@@ -544,14 +597,15 @@ def parse_args():
     parser.add_argument("--target-model", type=str, required=True)
     parser.add_argument("--adaptor-dir", type=str, required=True,
                         help="Directory containing adaptor.pt or adaptor_best.pt")
-    parser.add_argument("--source-memory", type=str,
-                        default="results/source_memory/memory.pt")
-    parser.add_argument("--memory-config", type=str,
-                        default="results/source_memory/memory_config.json")
+    # Runtime-recoverable settings default to None so a saved training config
+    # is not accidentally overwritten by parser defaults.
+    parser.add_argument("--condition", type=str, default=None)
+    parser.add_argument("--source-memory", type=str, default=None)
+    parser.add_argument("--memory-config", type=str, default=None)
     parser.add_argument("--tasks", nargs="+",
                         default=["hellaswag", "piqa", "arc_easy", "winogrande", "lambada", "boolq"],
                         choices=list(TASK_LOADERS.keys()))
-    parser.add_argument("--canon-mode", type=str, default="vocab",
+    parser.add_argument("--canon-mode", type=str, default=None,
                         choices=["vocab", "word_boundary"])
     parser.add_argument("--max-examples", type=int, default=None,
                         help="Limit examples per task (for quick testing)")
@@ -559,21 +613,51 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--injection-layers", type=str, default=None,
                         help="Comma-separated layer indices (e.g. '2,10'). Must match training.")
-    parser.add_argument("--adaptor-branches", type=int, default=1,
+    parser.add_argument("--adaptor-branches", type=int, default=None,
                         help="Number of adaptor branches. Must match training.")
+    parser.add_argument("--architecture", choices=["legacy", "generative"], default=None)
+    parser.add_argument("--reader-type", choices=["cross_attention", "mean"], default=None)
+    parser.add_argument("--generator-cue-source", choices=["engram", "learned"], default=None)
+    parser.add_argument("--generator-num-latents", type=int, default=None)
+    parser.add_argument("--generator-hidden-size", type=int, default=None)
+    parser.add_argument("--generator-layers", type=int, default=None)
+    parser.add_argument("--generator-heads", type=int, default=None)
+    parser.add_argument("--generator-cue-window", type=int, default=None)
+    parser.add_argument("--memory-dim", type=int, default=None)
     return parser.parse_args()
+
+
+def resolve_runtime_config(args: argparse.Namespace) -> dict:
+    """Recover architecture details saved next to the trained adaptor."""
+    runtime_config = dict(RUNTIME_CONFIG_DEFAULTS)
+    saved_path = Path(args.adaptor_dir) / "config.json"
+    if saved_path.exists():
+        with open(saved_path) as f:
+            saved_config = json.load(f)
+        runtime_config.update({
+            key: value for key, value in saved_config.items()
+            if key in RUNTIME_CONFIG_DEFAULTS and value is not None
+        })
+    for key in RUNTIME_CONFIG_DEFAULTS:
+        value = getattr(args, key, None)
+        if value is not None:
+            runtime_config[key] = value
+    return runtime_config
 
 
 def main():
     args = parse_args()
+    runtime_config = resolve_runtime_config(args)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16
-    if device.type == "cuda":
+    if device.type == "cpu":
+        dtype = torch.float32
+    else:
+        dtype = torch.float16
         cap = torch.cuda.get_device_capability()
         if cap[0] >= 8:
             dtype = torch.bfloat16
@@ -589,18 +673,48 @@ def main():
     print(f"Target model: {args.target_model}")
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Tasks: {args.tasks}")
+    print(f"Runtime config: {runtime_config}")
 
-    # Load memory config
-    with open(args.memory_config) as f:
-        mem_cfg_dict = json.load(f)
-
-    mem_cfg = MemoryConfig(
-        max_ngram=mem_cfg_dict["max_ngram"],
-        heads_per_order=mem_cfg_dict["heads_per_order"],
-        table_size=mem_cfg_dict["table_size"],
-        d_head=mem_cfg_dict["d_head"],
-        hash_seed=mem_cfg_dict["hash_seed"],
+    learned_generative = (
+        runtime_config["architecture"] == "generative"
+        and runtime_config["generator_cue_source"] == "learned"
     )
+    mem_cfg_dict = None
+    mem_cfg = None
+    if not learned_generative:
+        with open(runtime_config["memory_config"]) as f:
+            mem_cfg_dict = json.load(f)
+
+        mem_cfg = MemoryConfig(
+            max_ngram=mem_cfg_dict["max_ngram"],
+            heads_per_order=mem_cfg_dict["heads_per_order"],
+            table_size=mem_cfg_dict["table_size"],
+            d_head=mem_cfg_dict["d_head"],
+            hash_seed=mem_cfg_dict["hash_seed"],
+        )
+        memory_dim = mem_cfg.d_mem
+    else:
+        if runtime_config["memory_dim"] is None:
+            raise ValueError(
+                "Saved/CLI memory_dim is required for generative learned cues"
+            )
+        memory_dim = int(runtime_config["memory_dim"])
+
+    injection_layers = parse_injection_layers(runtime_config["injection_layers"])
+    wrapper_kwargs = dict(
+        injection_layers=injection_layers,
+        adaptor_branches=int(runtime_config["adaptor_branches"]),
+        memory_dim=memory_dim,
+        architecture=runtime_config["architecture"],
+        reader_type=runtime_config["reader_type"],
+        generator_cue_source=runtime_config["generator_cue_source"],
+        generator_num_latents=int(runtime_config["generator_num_latents"]),
+        generator_hidden_size=int(runtime_config["generator_hidden_size"]),
+        generator_layers=int(runtime_config["generator_layers"]),
+        generator_heads=int(runtime_config["generator_heads"]),
+        generator_cue_window=int(runtime_config["generator_cue_window"]),
+    )
+    treatment_name = "generative_learned" if learned_generative else runtime_config["condition"]
 
     # Find adaptor checkpoint
     adaptor_dir = Path(args.adaptor_dir)
@@ -639,8 +753,7 @@ def main():
         t0 = time.time()
         baseline_wrapper = setup_wrapper(
             args.target_model, None, "baseline", None, device, dtype,
-            injection_layers=parse_injection_layers(args.injection_layers),
-            adaptor_branches=args.adaptor_branches,
+            **wrapper_kwargs,
         )
 
         baseline_res = eval_fn(
@@ -656,37 +769,44 @@ def main():
         del baseline_wrapper
         torch.cuda.empty_cache()
 
-        # ── Transferred memory ──
-        print(f"\n  [2/2] Transferred memory...")
-        memory = EngramMemory(mem_cfg)
-        memory.load_state_dict(
-            torch.load(args.source_memory, map_location="cpu", weights_only=True)
-        )
-        for p in memory.parameters():
-            p.requires_grad = False
+        # ── Memory treatment ──
+        print(f"\n  [2/2] {treatment_name}...")
+        memory = None
+        if not learned_generative:
+            memory = EngramMemory(mem_cfg)
+            memory.load_state_dict(
+                torch.load(
+                    runtime_config["source_memory"],
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            )
+            for p in memory.parameters():
+                p.requires_grad = False
 
         t0 = time.time()
-        transferred_wrapper = setup_wrapper(
-            args.target_model, memory, "transferred", str(adaptor_path), device, dtype,
-            injection_layers=parse_injection_layers(args.injection_layers),
-            adaptor_branches=args.adaptor_branches,
+        treatment_wrapper = setup_wrapper(
+            args.target_model, memory, runtime_config["condition"],
+            str(adaptor_path), device, dtype,
+            **wrapper_kwargs,
         )
 
-        # Build canonicalization function
-        set_canon_fn = build_canon_fn(
-            transferred_wrapper, mem_cfg_dict, args.canon_mode, device,
-        )
+        set_canon_fn = None
+        if memory is not None:
+            set_canon_fn = build_canon_fn(
+                treatment_wrapper, mem_cfg_dict, runtime_config["canon_mode"], device,
+            )
 
-        transferred_res = eval_fn(
-            transferred_wrapper, tokenizer, examples, device, set_canon_fn=set_canon_fn,
+        treatment_res = eval_fn(
+            treatment_wrapper, tokenizer, examples, device, set_canon_fn=set_canon_fn,
         )
-        transferred_res["elapsed_s"] = time.time() - t0
-        task_results["transferred"] = transferred_res
-        print(f"    Accuracy: {transferred_res['accuracy']:.4f} "
-              f"({transferred_res['correct']}/{transferred_res['total']})")
+        treatment_res["elapsed_s"] = time.time() - t0
+        task_results[treatment_name] = treatment_res
+        print(f"    Accuracy: {treatment_res['accuracy']:.4f} "
+              f"({treatment_res['correct']}/{treatment_res['total']})")
 
         # Compute delta
-        delta_acc = transferred_res["accuracy"] - baseline_res["accuracy"]
+        delta_acc = treatment_res["accuracy"] - baseline_res["accuracy"]
         task_results["delta_accuracy"] = delta_acc
         task_results["delta_accuracy_pct"] = delta_acc * 100
         print(f"\n  Delta: {delta_acc:+.4f} ({delta_acc*100:+.2f}%)")
@@ -694,17 +814,19 @@ def main():
         all_results[task_name] = task_results
 
         # Cleanup
-        transferred_wrapper.cleanup()
-        del transferred_wrapper, memory
+        treatment_wrapper.cleanup()
+        del treatment_wrapper, memory
         torch.cuda.empty_cache()
 
     # Save results
     final = {
         "target_model": args.target_model,
         "adaptor_dir": args.adaptor_dir,
-        "source_memory": args.source_memory,
+        "source_memory": runtime_config["source_memory"],
         "seed": args.seed,
-        "canon_mode": args.canon_mode,
+        "canon_mode": runtime_config["canon_mode"],
+        "treatment": treatment_name,
+        "runtime_config": runtime_config,
         "tasks": all_results,
     }
     with open(results_file, "w") as f:
@@ -714,13 +836,13 @@ def main():
     print(f"\n{'='*60}")
     print("  Downstream Task Evaluation Summary")
     print(f"{'='*60}")
-    print(f"{'Task':<14} {'Baseline':>10} {'Transferred':>12} {'Delta':>8}")
-    print("-" * 46)
+    print(f"{'Task':<14} {'Baseline':>10} {treatment_name:>20} {'Delta':>8}")
+    print("-" * 54)
     for task_name, res in all_results.items():
         bl = res["baseline"]["accuracy"]
-        tr = res["transferred"]["accuracy"]
+        tr = res[treatment_name]["accuracy"]
         d = res["delta_accuracy_pct"]
-        print(f"{task_name:<14} {bl:>10.4f} {tr:>12.4f} {d:>+7.2f}%")
+        print(f"{task_name:<14} {bl:>10.4f} {tr:>20.4f} {d:>+7.2f}%")
 
     print(f"\nResults saved to {results_file}")
 

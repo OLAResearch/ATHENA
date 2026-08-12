@@ -1,15 +1,13 @@
-<h1 align="center">XMemTransfer</h1>
-<p align="center"><strong>Cross-Model Memory Transfer via Target-Side Reader Adaptation</strong></p>
+<h1 align="center">ATHENA</h1>
+<p align="center"><strong>Adaptive THeoretical Engram Network Architecture</strong></p>
 
 <p align="center">
-  <a href="https://olaresearch.github.io/XMemTransfer"><img src="https://img.shields.io/badge/Website-XMemTransfer-0A7EA4?style=flat-square" alt="Project website"></a>
-  <a href="https://huggingface.co/collections/OLAResearchX/xmemtransfer"><img src="https://img.shields.io/badge/Models-Hugging%20Face-F9D649?style=flat-square" alt="Model collection"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-4D7C0F?style=flat-square" alt="Apache 2.0 license"></a>
-  <a href="https://github.com/OLAResearch/XMemTransfer/stargazers"><img src="https://img.shields.io/github/stars/OLAResearch/XMemTransfer?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://github.com/MJLee00/ATHENA/stargazers"><img src="https://img.shields.io/github/stars/MJLee00/ATHENA?style=flat-square" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
-  XMemTransfer studies whether a frozen Engram-style external memory remains useful after it is
+  ATHENA studies whether a frozen Engram-style external memory remains useful after it is
   detached from the model that trained it and attached to a different backbone. The central result
   is a reader-first view of memory portability: the stored table matters, but successful transfer
   depends on a lightweight target-side reader that can extract and align the signal.
@@ -118,7 +116,7 @@ See [run/README.md](run/README.md) for runtime estimates and ordering constraint
 
 ## GitHub Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=OLAResearch/XMemTransfer&type=Date)](https://star-history.com/#OLAResearch/XMemTransfer&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=MJLee00/ATHENA&type=Date)](https://star-history.com/#MJLee00/ATHENA&Date)
 
 ## License
 

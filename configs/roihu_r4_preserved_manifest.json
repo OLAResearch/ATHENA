@@ -1,0 +1,38 @@
+{
+  "purpose": "Preserve comparable Roihu R4 NQ assets without submitting a new job.",
+  "dataset": {
+    "name": "google-research-datasets/nq_open",
+    "split": "validation",
+    "n_examples": 3609
+  },
+  "baseline": {
+    "model": "mistralai/Mistral-7B-v0.3",
+    "config": "configs/roihu_baseline_r4_nq.yaml",
+    "result": "results/mistral_wikipedia2021_roihu_20m_full_eval/openqa/baseline/openqa_results.json",
+    "f1": 0.2005589742008499,
+    "em": 0.14934885009697976,
+    "status": "evaluated"
+  },
+  "historical_engram_r4": {
+    "config": "configs/roihu_old_duallayer_r4_20m20m_nq.yaml",
+    "training_result": "results/roihu_old_duallayer_r4_20m20m_nq/adaptor/results.json",
+    "openqa_result": "results/roihu_old_duallayer_r4_20m20m_nq/openqa/openqa_results.json",
+    "f1": 0.30480894945591047,
+    "em": 0.21335550013854254,
+    "best_step": 9500,
+    "best_val_ppl": 8.161717414855957,
+    "status": "evaluated"
+  },
+  "generative_memory_aligned_r4": {
+    "config": "configs/roihu_generative_memory_r4_20m20m_nq.yaml",
+    "architecture": "generative",
+    "generator_cue_source": "engram",
+    "reader_type": "cross_attention",
+    "generator_fusion_type": "generated_only",
+    "injection_layers": [2, 10],
+    "adaptor_branches": 4,
+    "source_tokens": 20000000,
+    "adaptor_tokens": 20000000,
+    "status": "configuration_preserved_not_trained"
+  }
+}

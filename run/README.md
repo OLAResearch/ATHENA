@@ -1,5 +1,12 @@
 # Runner scripts
 
+Cluster submission files are separated from the portable experiment runners:
+
+- `run/lumi/`: LUMI Slurm files and their LUMI-only shell payloads.
+- `run/lumi/lumi_target_memgen_eval_gpqa.slurm`: full GPQA Diamond retry from pinned public mirrors when the canonical dataset is gated.
+- `run/roihu/`: Roihu Slurm files and their Roihu-only shell payloads.
+- `scripts/`: Python training and evaluation programs; no Slurm files belong there.
+
 Each `.sh` file reproduces one paper section end-to-end. Run from the repository root:
 
 ```

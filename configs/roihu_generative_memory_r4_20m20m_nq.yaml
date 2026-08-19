@@ -1,0 +1,62 @@
+# Generative-memory counterpart of the historical R4 NQ setup.
+# Source Engram lookup is frozen in phase 2; each target injection layer uses
+# the same causal Engram vectors as generator cues.
+
+source_training:
+  model: NousResearch/Llama-2-7b-hf
+  seed: 42
+  condition: transferred
+  freeze_backbone: true
+  max_tokens: 20000000
+  seq_len: 2048
+  batch_size: 1
+  grad_accum_steps: 1
+  lr: 3.0e-5
+  warmup_steps: 1000
+  table_size: 65536
+  d_head: 64
+  max_ngram: 3
+  heads_per_order: 4
+  injection_layers: [2, 10]
+  adaptor_branches: 4
+  canon_mode: word_boundary
+  corpus: wikipedia-2021
+  wikipedia2021_dataset: null
+  wikipedia2021_source_tokenizer: mistralai/Mistral-7B-v0.3
+  wikipedia2021_require_tokenizer_match: false
+  log_every: 50
+  eval_every: 500
+  early_stopping_patience: 3
+
+adaptor_training:
+  target_model: mistralai/Mistral-7B-v0.3
+  seed: 42
+  condition: transferred
+  architecture: generative
+  reader_type: cross_attention
+  generator_cue_source: engram
+  # Two independent readers: direct Engram reader + generated-memory reader,
+  # each with its own context gate.
+  generator_fusion_type: dual_reader
+  generator_num_latents: 4
+  generator_hidden_size: 256
+  generator_layers: 2
+  generator_heads: 4
+  generator_cue_window: 3
+  max_tokens: 20000000
+  seq_len: 2048
+  batch_size: 1
+  grad_accum_steps: 1
+  lr: 3.0e-5
+  warmup_steps: 500
+  injection_layers: [2, 10]
+  adaptor_branches: 4
+  canon_mode: word_boundary
+  corpus: wikipedia-2021
+  wikipedia2021_dataset: null
+  wikipedia2021_source_tokenizer: mistralai/Mistral-7B-v0.3
+  wikipedia2021_require_tokenizer_match: false
+  log_every: 50
+  eval_every: 500
+  early_stopping_patience: 3
+  skip_final_test_eval: true

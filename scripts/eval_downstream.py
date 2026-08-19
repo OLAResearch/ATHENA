@@ -56,6 +56,7 @@ RUNTIME_CONFIG_DEFAULTS = {
     "generator_layers": 2,
     "generator_heads": 4,
     "generator_cue_window": 3,
+    "generator_fusion_type": "generated_only",
     "memory_dim": None,
     "injection_layers": None,
     "adaptor_branches": 1,
@@ -521,6 +522,7 @@ def setup_wrapper(
     generator_layers: int = 2,
     generator_heads: int = 4,
     generator_cue_window: int = 3,
+    generator_fusion_type: str = "generated_only",
 ) -> BackboneWrapper:
     """Create and configure a BackboneWrapper."""
     wrapper = BackboneWrapper(
@@ -540,6 +542,7 @@ def setup_wrapper(
         generator_layers=generator_layers,
         generator_heads=generator_heads,
         generator_cue_window=generator_cue_window,
+        generator_fusion_type=generator_fusion_type,
     )
 
     if adaptor_path and Path(adaptor_path).exists() and wrapper.adaptor is not None:
@@ -623,6 +626,7 @@ def parse_args():
     parser.add_argument("--generator-layers", type=int, default=None)
     parser.add_argument("--generator-heads", type=int, default=None)
     parser.add_argument("--generator-cue-window", type=int, default=None)
+    parser.add_argument("--generator-fusion-type", choices=["generated_only", "engram_residual", "dual_reader"], default=None)
     parser.add_argument("--memory-dim", type=int, default=None)
     return parser.parse_args()
 
@@ -713,6 +717,7 @@ def main():
         generator_layers=int(runtime_config["generator_layers"]),
         generator_heads=int(runtime_config["generator_heads"]),
         generator_cue_window=int(runtime_config["generator_cue_window"]),
+        generator_fusion_type=runtime_config["generator_fusion_type"],
     )
     treatment_name = "generative_learned" if learned_generative else runtime_config["condition"]
 

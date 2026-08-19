@@ -251,6 +251,7 @@ def build_adaptor(
     generator_layers: int = 2,
     generator_heads: int = 4,
     generator_cue_window: int = 3,
+    generator_fusion_type: str = "generated_only",
 ) -> nn.Module:
     """Factory function for adaptor variants.
 
@@ -283,6 +284,8 @@ def build_adaptor(
             num_heads=generator_heads,
             cue_window=generator_cue_window,
             gate_bias_init=gate_bias_init,
+            num_branches=num_branches,
+            fusion_type=generator_fusion_type,
         )
     if condition in ("transferred", "random_memory", "permuted_keys", "train_from_scratch"):
         if num_branches > 1:

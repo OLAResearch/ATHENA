@@ -89,6 +89,14 @@ def parse_args():
     parser.add_argument("--target-model", type=str, required=True)
     parser.add_argument("--adaptor-dir", type=str, default=None,
                         help="Directory containing adaptor.pt/adaptor_best.pt for transferred runs")
+    parser.add_argument("--adaptor-checkpoint", type=str, default=None,
+                        help="Optional checkpoint override while retaining adaptor-dir runtime config")
+    parser.add_argument(
+        "--dual-reader-mode",
+        choices=["both", "engram_only", "generated_only"],
+        default="both",
+        help="Runtime-only dual-reader ablation; generated_only still uses Engram cues",
+    )
     parser.add_argument("--source-memory", type=str, default="results/source_memory/memory.pt")
     parser.add_argument("--memory-config", type=str, default="results/source_memory/memory_config.json")
     parser.add_argument("--tasks", nargs="+", default=TASKS, choices=TASKS)
@@ -220,6 +228,9 @@ def load_webqa_examples():
 def load_triviaqa_examples():
     dataset, meta = load_dataset_with_fallback(
         candidates=[
+            # MemGen's published TriviaQA evaluation uses this configuration
+            # and its validation split as the held-out evaluation set.
+            ("mandarjoshi/trivia_qa", "rc.wikipedia.nocontext"),
             ("mandarjoshi/trivia_qa", "rc.nocontext"),
             ("mandarjoshi/trivia_qa", "unfiltered.nocontext"),
         ],
@@ -405,6 +416,16 @@ def setup_wrapper(
     dtype: torch.dtype,
     injection_layers: Optional[list[int]] = None,
     adaptor_branches: int = 1,
+    memory_dim: Optional[int] = None,
+    architecture: str = "legacy",
+    reader_type: str = "cross_attention",
+    generator_cue_source: str = "engram",
+    generator_num_latents: int = 4,
+    generator_hidden_size: int = 256,
+    generator_layers: int = 2,
+    generator_heads: int = 4,
+    generator_cue_window: int = 3,
+    generator_fusion_type: str = "generated_only",
 ) -> BackboneWrapper:
     wrapper = BackboneWrapper(
         model_name=model_name,
@@ -414,6 +435,16 @@ def setup_wrapper(
         dtype=dtype,
         injection_layers=injection_layers,
         adaptor_branches=adaptor_branches,
+        memory_dim=memory_dim,
+        architecture=architecture,
+        reader_type=reader_type,
+        generator_cue_source=generator_cue_source,
+        generator_num_latents=generator_num_latents,
+        generator_hidden_size=generator_hidden_size,
+        generator_layers=generator_layers,
+        generator_heads=generator_heads,
+        generator_cue_window=generator_cue_window,
+        generator_fusion_type=generator_fusion_type,
     )
     wrapper.tokenizer.padding_side = "left"
     if wrapper.tokenizer.pad_token_id is None and wrapper.tokenizer.eos_token_id is not None:
@@ -557,12 +588,33 @@ def setup_condition(args, condition: str, device: torch.device, dtype: torch.dty
         args.target_model,
         memory=memory,
         condition=condition,
-        adaptor_path=resolve_adaptor_path(args.adaptor_dir),
+        adaptor_path=(
+            getattr(args, "adaptor_checkpoint", None)
+            or resolve_adaptor_path(args.adaptor_dir)
+        ),
         device=device,
         dtype=dtype,
         injection_layers=parse_injection_layers(adaptor_cfg.get("injection_layers")),
         adaptor_branches=int(adaptor_cfg.get("adaptor_branches", 1)),
+        memory_dim=adaptor_cfg.get("memory_dim", mem_cfg.d_mem),
+        architecture=adaptor_cfg.get("architecture", "legacy"),
+        reader_type=adaptor_cfg.get("reader_type", "cross_attention"),
+        generator_cue_source=adaptor_cfg.get("generator_cue_source", "engram"),
+        generator_num_latents=int(adaptor_cfg.get("generator_num_latents", 4)),
+        generator_hidden_size=int(adaptor_cfg.get("generator_hidden_size", 256)),
+        generator_layers=int(adaptor_cfg.get("generator_layers", 2)),
+        generator_heads=int(adaptor_cfg.get("generator_heads", 4)),
+        generator_cue_window=int(adaptor_cfg.get("generator_cue_window", 3)),
+        generator_fusion_type=adaptor_cfg.get("generator_fusion_type", "generated_only"),
     )
+    dual_reader_mode = getattr(args, "dual_reader_mode", "both")
+    if dual_reader_mode != "both":
+        adaptors = list(wrapper.adaptor) if isinstance(wrapper.adaptor, torch.nn.ModuleList) else [wrapper.adaptor]
+        for adaptor in adaptors:
+            setter = getattr(adaptor, "set_dual_reader_mode", None)
+            if setter is None:
+                raise TypeError("--dual-reader-mode requires a generative dual-reader adaptor")
+            setter(dual_reader_mode)
     set_canon_fn = build_canon_fn(wrapper, mem_cfg_dict, args.canon_mode, device)
     return wrapper, set_canon_fn
 
@@ -576,6 +628,7 @@ def greedy_generate(
     max_new_tokens: int,
     max_context_length: int,
     official_tokenization: bool,
+    stop_at_newline: bool = True,
 ) -> str:
     if official_tokenization:
         # Mirror the official MLPMemory QA evaluation tokenization/truncation
@@ -591,15 +644,27 @@ def greedy_generate(
         )["input_ids"].to(device)
     generated = input_ids
     new_token_ids = []
+    past_key_values = None
 
     for _ in range(max_new_tokens):
         if not official_tokenization and generated.shape[1] > max_context_length:
+            # Once the left side is truncated, the existing cache no longer
+            # represents the visible context and must be rebuilt.
             generated = generated[:, -max_context_length:]
+            past_key_values = None
         if set_canon_fn is not None:
             set_canon_fn(generated)
+        model_input = generated if past_key_values is None else generated[:, -1:]
+        attention_mask = torch.ones_like(generated, device=device)
         with torch.no_grad():
-            outputs = wrapper(input_ids=generated)
+            outputs = wrapper(
+                input_ids=model_input,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            past_key_values = outputs.past_key_values
 
         token_id = int(next_token.item())
         if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
@@ -608,7 +673,9 @@ def greedy_generate(
         generated = torch.cat([generated, next_token], dim=1)
 
     continuation = tokenizer.decode(new_token_ids, skip_special_tokens=True)
-    return continuation.split("\n")[0].strip()
+    if stop_at_newline:
+        continuation = continuation.split("\n")[0]
+    return continuation.strip()
 
 
 def compute_continuation_logprob(
@@ -707,6 +774,8 @@ def evaluate_openqa(
     em = correct / total if total else 0.0
     mean_f1 = float(np.mean(f1_values)) if f1_values else 0.0
     return {
+        # For OpenQA, accuracy is exact-match accuracy by definition.
+        "acc": em,
         "em": em,
         "f1": mean_f1,
         "correct": correct,
@@ -807,12 +876,15 @@ def evaluate_truthfulqa(
 
     total = len(examples)
     if total == 0:
-        return {"mc1": 0.0, "mc2": 0.0, "mc3": 0.0, "mc_avg": 0.0, "total": 0, "sample_examples": []}
+        return {"acc": 0.0, "mc1": 0.0, "mc2": 0.0, "mc3": 0.0, "mc_avg": 0.0, "total": 0, "sample_examples": []}
 
     mc1 = totals["MC1"] / total
     mc2 = totals["MC2"] / total
     mc3 = totals["MC3"] / total
     return {
+        # TruthfulQA's single-answer accuracy is MC1; retain all three
+        # official metrics below as well.
+        "acc": mc1,
         "mc1": mc1,
         "mc2": mc2,
         "mc3": mc3,
@@ -855,6 +927,7 @@ def main():
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Tasks: {args.tasks}")
     print(f"Conditions: {args.conditions}")
+    print(f"Dual-reader mode: {args.dual_reader_mode}")
 
     condition_state = {}
     for condition in args.conditions:
@@ -965,6 +1038,8 @@ def main():
         "target_model": args.target_model,
         "seed": args.seed,
         "canon_mode": args.canon_mode,
+        "adaptor_checkpoint": args.adaptor_checkpoint,
+        "dual_reader_mode": args.dual_reader_mode,
         "conditions": args.conditions,
         "tasks": all_results,
         "summary": summary,

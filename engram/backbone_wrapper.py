@@ -7,6 +7,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .adaptor import build_adaptor
+from .hf_utils import resolve_pretrained_source
 from .memory import EngramMemory
 
 
@@ -37,6 +38,7 @@ class BackboneWrapper(nn.Module):
         generator_layers: int = 2,
         generator_heads: int = 4,
         generator_cue_window: int = 3,
+        generator_fusion_type: str = "generated_only",
     ):
         super().__init__()
         self.model_name = model_name
@@ -45,16 +47,20 @@ class BackboneWrapper(nn.Module):
         self.adaptor_branches = adaptor_branches
         self.architecture = architecture
         self.generator_cue_source = generator_cue_source
+        self.generator_fusion_type = generator_fusion_type
 
         # Load backbone
         # Phi-4-mini's custom modeling code is incompatible with transformers 5.x;
         # use built-in phi3 support instead. Only enable trust_remote_code for
         # models that actually need it (e.g., Qwen).
         needs_remote_code = "Phi" not in model_name
+        pretrained_source = resolve_pretrained_source(model_name)
         self.backbone = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=dtype, trust_remote_code=needs_remote_code,
+            pretrained_source, torch_dtype=dtype, trust_remote_code=needs_remote_code,
         ).to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=needs_remote_code)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_source, trust_remote_code=needs_remote_code
+        )
 
         # Determine model architecture
         self.d_model = self._get_d_model()
@@ -80,6 +86,7 @@ class BackboneWrapper(nn.Module):
             generator_layers=generator_layers,
             generator_heads=generator_heads,
             generator_cue_window=generator_cue_window,
+            generator_fusion_type=generator_fusion_type,
         )
         if len(self.injection_layers) == 1:
             self.adaptor = build_adaptor(
@@ -227,10 +234,34 @@ class BackboneWrapper(nn.Module):
             return None
 
         if self._current_hash_indices is not None:
-            return self.memory.forward_from_indices(self._current_hash_indices)
+            indices = self._tail_context(self._current_hash_indices, hidden_states)
+            return self.memory.forward_from_indices(indices)
         elif self._current_canon_ids is not None:
-            return self.memory(self._current_canon_ids)
+            canon_ids = self._tail_context(self._current_canon_ids, hidden_states)
+            return self.memory(canon_ids)
         return None
+
+    @staticmethod
+    def _tail_context(context: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Align precomputed memory context with cached-decoding hidden states.
+
+        During the initial forward pass the transformer sees the complete prompt,
+        so the canonical/hash context has the same sequence length.  With KV-cache
+        decoding, later forward passes normally contain only the newest token while
+        canonicalization still needs the complete generated prefix to construct the
+        correct n-gram.  In that case only the final context positions belong to the
+        hidden states handled by the current transformer call.
+        """
+        hidden_length = hidden_states.shape[1]
+        context_length = context.shape[1]
+        if context_length < hidden_length:
+            raise ValueError(
+                "Memory context is shorter than the transformer hidden sequence: "
+                f"context={context_length}, hidden={hidden_length}"
+            )
+        if context_length == hidden_length:
+            return context
+        return context[:, -hidden_length:]
 
     def set_canon_ids(self, canon_ids: torch.LongTensor) -> None:
         """Set canonical IDs for the next forward pass."""
@@ -247,6 +278,7 @@ class BackboneWrapper(nn.Module):
         input_ids: torch.LongTensor,
         labels: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        **backbone_kwargs,
     ):
         """Forward pass through backbone with memory injection via hook.
 
@@ -258,6 +290,7 @@ class BackboneWrapper(nn.Module):
             input_ids=input_ids,
             labels=labels,
             attention_mask=attention_mask,
+            **backbone_kwargs,
         )
         if not self._current_forward_gate_values:
             self._last_gate_values = None

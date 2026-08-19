@@ -5,4 +5,13 @@ results/
 docs/
 REPRODUCE_hit_at_k.md
 *.pdf
+.venv/
+ROIHU_R4_PRESERVED.md
 data/
+.vscode/
+logs/
+configs/
+__pycache__/
+tmp/
+run/roihu/
+run/lumi/

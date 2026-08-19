@@ -1,0 +1,15 @@
+# Evaluation-only record for the Mistral baseline paired with the historical
+# R4 Engram experiment.  No memory or adaptor is enabled in this condition.
+
+evaluation:
+  target_model: mistralai/Mistral-7B-v0.3
+  seed: 42
+  task: nq
+  dataset: google-research-datasets/nq_open
+  split: validation
+  canon_mode: word_boundary
+  condition: baseline
+
+# This file records the baseline/evaluation setup; it is not a training job.
+# The complete existing result is kept at:
+# results/mistral_wikipedia2021_roihu_20m_full_eval/openqa/baseline/

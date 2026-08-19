@@ -55,7 +55,7 @@ class WikiTextDataset(Dataset):
 
         # Load dataset
         from datasets import load_dataset
-        dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
+        dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
 
         # Tokenize and concatenate all text
         all_ids = []
@@ -285,7 +285,11 @@ class Wikipedia2021Dataset(Dataset):
         if not direct_ids_compatible:
             from transformers import AutoTokenizer
 
-            source_tokenizer = AutoTokenizer.from_pretrained(source_tokenizer_name)
+            from .hf_utils import resolve_pretrained_source
+
+            source_tokenizer = AutoTokenizer.from_pretrained(
+                resolve_pretrained_source(source_tokenizer_name)
+            )
             print(
                 "  Wikipedia-2021: source tokenizer mismatch detected; "
                 f"re-tokenizing from {source_tokenizer_name} to "
@@ -586,7 +590,7 @@ def verify_split_disjointness(tokenizer, seq_len: int = 512) -> dict:
 
     for split in ("train", "validation", "test"):
         from datasets import load_dataset
-        dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
+        dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
         texts = set()
         for example in dataset:
             text = example["text"].strip()

@@ -33,6 +33,7 @@ from engram.memory import EngramMemory, MemoryConfig
 from engram.adaptor import build_adaptor
 from engram.backbone_wrapper import BackboneWrapper
 from engram.canonicalization import build_canonicalizer, WordBoundaryCanonicalizer
+from engram.hf_utils import resolve_pretrained_source
 from engram.hashing import HashConfig, WordNgramHasher
 from engram.data import get_dataloader
 from engram.metrics import compute_perplexity, compute_batch_perplexities, bootstrap_ci
@@ -69,6 +70,12 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument(
+        "--validation-max-tokens",
+        type=int,
+        default=2_000_000,
+        help="Validation-token cap (keep the default for full runs; lower only for smoke tests)",
+    )
     parser.add_argument("--injection-layers", type=str, default=None,
                         help="Comma-separated layer indices for memory injection")
     parser.add_argument("--adaptor-branches", type=int, default=1,
@@ -81,6 +88,12 @@ def parse_args():
     parser.add_argument("--generator-layers", type=int, default=2)
     parser.add_argument("--generator-heads", type=int, default=4)
     parser.add_argument("--generator-cue-window", type=int, default=3)
+    parser.add_argument(
+        "--generator-fusion-type",
+        choices=["generated_only", "engram_residual", "dual_reader"],
+        default="generated_only",
+        help="Fuse generated latent value alone or retain an Engram residual.",
+    )
     parser.add_argument("--memory-dim", type=int, default=None,
                         help="Memory/cue dimension for generative learned controls")
     # Cross-tokenizer mode
@@ -143,6 +156,25 @@ def parse_injection_layers(raw) -> list[int] | None:
         for part in re.split(r"[\s,:;]+", raw)
         if part.strip()
     ]
+
+
+def enable_frozen_backbone_gradient_checkpointing(wrapper: BackboneWrapper) -> None:
+    """Enable checkpointing without severing gradients to injected adaptors.
+
+    Hugging Face's default re-entrant checkpointing requires at least one input
+    tensor to require gradients.  ATHENA freezes every backbone parameter and
+    injects the trainable adaptor through layer hooks, so the embedding output
+    would otherwise be non-differentiable.  This only asks autograd to track the
+    embedding output; it does not unfreeze or optimize any backbone parameter.
+    """
+    wrapper.backbone.gradient_checkpointing_enable()
+    enable_input_grads = getattr(wrapper.backbone, "enable_input_require_grads", None)
+    if enable_input_grads is None:
+        raise RuntimeError(
+            "The selected backbone does not expose enable_input_require_grads(), "
+            "which is required when gradient checkpointing a frozen backbone"
+        )
+    enable_input_grads()
 
 
 def setup_memory(args, device) -> tuple:
@@ -237,7 +269,7 @@ def main():
     torch.manual_seed(args.seed)
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    tokenizer = AutoTokenizer.from_pretrained(resolve_pretrained_source(args.target_model))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -267,6 +299,7 @@ def main():
         generator_layers=args.generator_layers,
         generator_heads=args.generator_heads,
         generator_cue_window=args.generator_cue_window,
+        generator_fusion_type=args.generator_fusion_type,
     )
 
     if args.init_adaptor is not None:
@@ -287,8 +320,8 @@ def main():
 
     # Enable gradient checkpointing if requested (saves memory for large models)
     if args.gradient_checkpointing:
-        wrapper.backbone.gradient_checkpointing_enable()
-        print("Gradient checkpointing enabled")
+        enable_frozen_backbone_gradient_checkpointing(wrapper)
+        print("Gradient checkpointing enabled with differentiable frozen inputs")
 
     # For train_from_scratch, memory is trainable
     if args.condition == "train_from_scratch":
@@ -351,7 +384,7 @@ def main():
         tokenizer=tokenizer,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
-        max_tokens=2_000_000,
+        max_tokens=args.validation_max_tokens,
         shuffle=False,
         corpus=args.corpus,
         corpus_subset=args.corpus_subset,

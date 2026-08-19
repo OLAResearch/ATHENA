@@ -69,6 +69,124 @@ def test_build_adaptor_and_generator_boundary():
     assert "h" not in inspect.signature(adaptor._generate).parameters
     learned = build_adaptor("transferred", 16, 8, architecture="generative", generator_cue_source="learned")
     assert learned.cue_projection is None
+    branched = build_adaptor(
+        "transferred",
+        16,
+        8,
+        architecture="generative",
+        num_branches=4,
+        generator_fusion_type="generated_only",
+    )
+    assert branched.num_branches == 4
+
+
+def test_four_branch_engram_cues_flow_through_generator_and_reader():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="generated_only",
+    )
+    contribution, gates = adaptor(h, mem)
+    assert contribution.shape == h.shape
+    assert gates.shape == (4, *h.shape[:2])
+    loss = contribution.square().mean() + gates.mean()
+    loss.backward()
+    assert adaptor.cue_projection.weight.grad is not None
+    assert all(projection.weight.grad is not None for projection in adaptor.memory_key_projection)
+
+
+def test_engram_residual_fusion_keeps_generator_in_chain():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="engram_residual",
+    )
+    contribution, gates = adaptor(h, mem)
+    assert contribution.shape == h.shape
+    assert gates.shape == (4, *h.shape[:2])
+    (contribution.square().mean() + gates.mean()).backward()
+    assert adaptor.engram_value_projection.weight.grad is not None
+    assert adaptor.delta_gate_bias.grad is not None
+
+
+def test_dual_reader_has_independent_engram_and_generated_gates():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="dual_reader",
+    )
+    contribution, gates = adaptor(h, mem)
+    assert contribution.shape == h.shape
+    assert gates.shape == (2, 4, *h.shape[:2])
+    (contribution.square().mean() + gates.mean()).backward()
+    assert adaptor.engram_value_projection.weight.grad is not None
+    assert adaptor.output_projection.weight.grad is not None
+    assert adaptor.engram_gate_bias.grad is not None
+
+
+def test_dual_reader_runtime_ablation_zeroes_only_selected_gate():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="dual_reader",
+    )
+    both, both_gates = adaptor(h, mem)
+
+    adaptor.set_dual_reader_mode("engram_only")
+    engram_only, engram_gates = adaptor(h, mem)
+    assert torch.count_nonzero(engram_gates[0]) == 0
+    assert torch.allclose(engram_gates[1], both_gates[1])
+
+    adaptor.set_dual_reader_mode("generated_only")
+    generated_only, generated_gates = adaptor(h, mem)
+    assert torch.allclose(generated_gates[0], both_gates[0])
+    assert torch.count_nonzero(generated_gates[1]) == 0
+    assert torch.allclose(both, engram_only + generated_only, atol=1e-6, rtol=1e-5)
+
+
+def test_dual_reader_can_train_only_generated_branch():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="dual_reader",
+    )
+    trainable_names = adaptor.train_generated_branch_only()
+
+    assert trainable_names
+    assert adaptor.latent_queries.requires_grad
+    assert adaptor.output_projection.weight.requires_grad
+    assert adaptor.gate_bias.requires_grad
+    assert not adaptor.norm_h.weight.requires_grad
+    assert not adaptor.engram_value_projection.weight.requires_grad
+    assert not adaptor.engram_gate_bias.requires_grad
+    assert all(not p.requires_grad for p in adaptor.engram_reader_norm.parameters())
+
+    contribution, gates = adaptor(h, mem)
+    (contribution.square().mean() + gates[0].mean()).backward()
+    assert adaptor.output_projection.weight.grad is not None
+    assert adaptor.gate_bias.grad is not None
+    assert adaptor.engram_value_projection.weight.grad is None
+    assert adaptor.engram_gate_bias.grad is None
 
 
 def test_learned_setup_memory_does_not_open_engram_files():

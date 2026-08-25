@@ -99,6 +99,13 @@ def parse_args():
     )
     parser.add_argument("--source-memory", type=str, default="results/source_memory/memory.pt")
     parser.add_argument("--memory-config", type=str, default="results/source_memory/memory_config.json")
+    parser.add_argument(
+        "--triviaqa-config",
+        type=str,
+        choices=["rc.nocontext"],
+        default="rc.nocontext",
+        help="Fixed TriviaQA validation configuration used by the five-task comparison",
+    )
     parser.add_argument("--tasks", nargs="+", default=TASKS, choices=TASKS)
     parser.add_argument("--conditions", nargs="+", default=["baseline", "transferred"],
                         choices=EVAL_CONDITIONS)
@@ -107,6 +114,16 @@ def parse_args():
     parser.add_argument("--max-examples", type=int, default=None,
                         help="Limit examples per task (<=0 disables the limit)")
     parser.add_argument("--max-new-tokens", type=int, default=15)
+    parser.add_argument(
+        "--reasoning-mode",
+        choices=["vanilla", "cot"],
+        default="vanilla",
+        help=(
+            "Prompt mode for generated-answer tasks. Vanilla preserves the "
+            "historical eval_openqa prompt; cot extracts the final answer "
+            "from an optional <answer> block before scoring."
+        ),
+    )
     parser.add_argument("--max-context-length", type=int, default=None,
                         help="Override model max context during eval")
     parser.add_argument("--seed", type=int, default=42)
@@ -225,16 +242,19 @@ def load_webqa_examples():
     return examples, meta
 
 
-def load_triviaqa_examples():
+def load_triviaqa_examples(config_name: str = "rc.nocontext"):
+    if config_name != "rc.nocontext":
+        raise ValueError(
+            "The comparable five-task evaluation requires TriviaQA config rc.nocontext"
+        )
     dataset, meta = load_dataset_with_fallback(
         candidates=[
-            # MemGen's published TriviaQA evaluation uses this configuration
-            # and its validation split as the held-out evaluation set.
-            ("mandarjoshi/trivia_qa", "rc.wikipedia.nocontext"),
-            ("mandarjoshi/trivia_qa", "rc.nocontext"),
-            ("mandarjoshi/trivia_qa", "unfiltered.nocontext"),
+            # Do not fall back to a different TriviaQA configuration: the
+            # smaller rc.wikipedia.nocontext split makes method comparisons
+            # depend on cache availability.
+            ("mandarjoshi/trivia_qa", config_name),
         ],
-        split_candidates=["validation", "test"],
+        split_candidates=["validation"],
     )
     examples = []
     for ex in dataset:
@@ -317,8 +337,14 @@ def normalize_question(question: str) -> str:
     return question
 
 
-def build_openqa_prompt(question: str) -> str:
+def build_openqa_prompt(question: str, reasoning_mode: str = "vanilla") -> str:
     question_text = normalize_question(question)
+    if reasoning_mode == "cot":
+        return (
+            "Answer these questions step by step, then put only the concise final "
+            "answer inside <answer></answer>.\n"
+            f"Question: {question_text}\nAnswer:"
+        )
     return f"Answer these questions:\nQuestion: {question_text}\nAnswer:"
 
 
@@ -629,7 +655,19 @@ def greedy_generate(
     max_context_length: int,
     official_tokenization: bool,
     stop_at_newline: bool = True,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
 ) -> str:
+    """Generate one continuation, optionally using nucleus sampling.
+
+    The default remains the historical greedy path.  Sampling is used only by
+    the code Pass@k evaluator and still runs through the same wrapper/canon
+    state updates as greedy generation.
+    """
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    if not 0 < top_p <= 1:
+        raise ValueError("top_p must be in (0, 1]")
     if official_tokenization:
         # Mirror the official MLPMemory QA evaluation tokenization/truncation
         # path while still updating Engram state each decode step.
@@ -663,7 +701,22 @@ def greedy_generate(
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            logits = outputs.logits[:, -1, :]
+            if temperature == 0.0:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                    remove = cumulative_probs > top_p
+                    remove[..., 1:] = remove[..., :-1].clone()
+                    remove[..., 0] = False
+                    sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+                    logits = torch.full_like(logits, float("-inf"))
+                    logits.scatter_(1, sorted_indices, sorted_logits)
+                probabilities = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1)
             past_key_values = outputs.past_key_values
 
         token_id = int(next_token.item())
@@ -737,6 +790,7 @@ def evaluate_openqa(
     device: torch.device,
     max_new_tokens: int,
     max_context_length: int,
+    reasoning_mode: str = "vanilla",
 ) -> dict:
     correct = 0
     f1_values = []
@@ -744,7 +798,7 @@ def evaluate_openqa(
     official_tokenization = use_official_tokenization(task_name)
 
     for ex in tqdm(examples, desc="Evaluating OpenQA", leave=False):
-        prompt = build_openqa_prompt(ex["question"])
+        prompt = build_openqa_prompt(ex["question"], reasoning_mode=reasoning_mode)
         prediction = greedy_generate(
             wrapper,
             tokenizer,
@@ -754,7 +808,23 @@ def evaluate_openqa(
             max_new_tokens=max_new_tokens,
             max_context_length=max_context_length,
             official_tokenization=official_tokenization,
+            stop_at_newline=(reasoning_mode == "vanilla"),
         )
+        if reasoning_mode == "cot":
+            answer_matches = re.findall(
+                r"<answer>(.*?)</answer>", prediction, flags=re.DOTALL | re.IGNORECASE
+            )
+            if answer_matches:
+                prediction = answer_matches[-1].strip()
+            else:
+                lines = [line.strip() for line in prediction.splitlines() if line.strip()]
+                prediction = lines[-1] if lines else ""
+                prediction = re.sub(
+                    r"^(?:final answer|answer)\s*:\s*",
+                    "",
+                    prediction,
+                    flags=re.IGNORECASE,
+                ).strip()
         answers = ex["answers"]
         is_correct = any(exact_match(prediction, answer) for answer in answers)
         best_f1 = max(f1_score(prediction, answer)[0] for answer in answers)
@@ -927,6 +997,7 @@ def main():
     print(f"Device: {device}, dtype: {dtype}")
     print(f"Tasks: {args.tasks}")
     print(f"Conditions: {args.conditions}")
+    print(f"Reasoning mode: {args.reasoning_mode}")
     print(f"Dual-reader mode: {args.dual_reader_mode}")
 
     condition_state = {}
@@ -948,7 +1019,10 @@ def main():
         print(f"Task: {task_name}")
         print(f"{'=' * 60}")
 
-        examples, dataset_meta = TASK_LOADERS[task_name]()
+        if task_name == "triviaqa":
+            examples, dataset_meta = load_triviaqa_examples(args.triviaqa_config)
+        else:
+            examples, dataset_meta = TASK_LOADERS[task_name]()
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
         print(f"Loaded {len(examples)} examples from {dataset_meta}")
@@ -992,6 +1066,7 @@ def main():
                     device=device,
                     max_new_tokens=args.max_new_tokens,
                     max_context_length=max_context_length,
+                    reasoning_mode=args.reasoning_mode,
                 )
                 print(
                     f"  {condition}: EM={metrics['em']*100:.2f} "
@@ -1038,6 +1113,8 @@ def main():
         "target_model": args.target_model,
         "seed": args.seed,
         "canon_mode": args.canon_mode,
+        "triviaqa_config": args.triviaqa_config,
+        "reasoning_mode": args.reasoning_mode,
         "adaptor_checkpoint": args.adaptor_checkpoint,
         "dual_reader_mode": args.dual_reader_mode,
         "conditions": args.conditions,

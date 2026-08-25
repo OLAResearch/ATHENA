@@ -1,8 +1,12 @@
 """Evaluate vanilla or ATHENA memory-augmented models in ALFWorld.
 
-The task-facing metric is episode success rate (``acc``). ALFWorld has no
-reference answer string, so ``em`` and ``f1`` are recorded as null rather than
-inventing text metrics for an interactive control benchmark.
+The task-facing metrics are ALFWorld episode success rate (SR), taken from
+``infos["won"]``, and goal-condition success rate (GC-SR) when the selected
+environment exposes ``infos["goal_condition_success_rate"]``.  The text-only
+``AlfredTWEnv`` shipped by ALFWorld normally exposes SR but not GC-SR; in that
+case GC-SR is recorded as ``null`` with an explicit availability note rather
+than silently substituting SR.  ALFWorld has no reference answer string, so
+``em`` and ``f1`` remain null.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=24)
     parser.add_argument("--max-context-length", type=int, default=None)
     parser.add_argument("--history-turns", type=int, default=6)
+    parser.add_argument("--reasoning-mode", choices=["vanilla", "cot"], default="vanilla")
     parser.add_argument(
         "--dual-reader-mode",
         choices=["both", "engram_only", "generated_only"],
@@ -135,16 +140,21 @@ def build_action_prompt(
     current_observation: str,
     candidates: list[str],
     history_turns: int,
+    reasoning_mode: str = "vanilla",
 ) -> str:
     recent = history[-history_turns:]
     transcript = []
     for action, observation in recent:
         transcript.append(f"Action: {action}\nObservation: {observation}")
     command_list = "\n".join(f"- {command}" for command in candidates)
+    reasoning_hint = (
+        "Think through the next action step by step internally, then output only the command. "
+        if reasoning_mode == "cot" else ""
+    )
     return (
         "You are controlling an agent in ALFWorld. Complete the household task. "
-        "Choose exactly one command from the admissible command list and output "
-        "only that command.\n\n"
+        + reasoning_hint
+        + "Choose exactly one command from the admissible command list and output only that command.\n\n"
         f"Initial task and observation:\n{initial_observation}\n\n"
         + ("Recent trajectory:\n" + "\n".join(transcript) + "\n\n" if transcript else "")
         + f"Current observation:\n{current_observation}\n\n"
@@ -169,6 +179,7 @@ def evaluate_environment(env, wrapper, set_canon_fn, device, args, num_games: in
         gamefile = str(infos.get("extra.gamefile", [""])[0])
         history: list[tuple[str, str]] = []
         success = 0.0
+        goal_condition_values: list[float] = []
         episode_actions = []
         started = time.time()
 
@@ -180,6 +191,7 @@ def evaluate_environment(env, wrapper, set_canon_fn, device, args, num_games: in
                 observation,
                 candidates,
                 args.history_turns,
+                args.reasoning_mode,
             )
             generated = greedy_generate(
                 wrapper,
@@ -196,6 +208,12 @@ def evaluate_environment(env, wrapper, set_canon_fn, device, args, num_games: in
             next_observations, _, dones, infos = env.step([action])
             next_observation = str(next_observations[0])
             success = float(infos["won"][0])
+            raw_gc = infos.get("goal_condition_success_rate")
+            if raw_gc is not None:
+                try:
+                    goal_condition_values.append(float(raw_gc[0]))
+                except (TypeError, IndexError, ValueError):
+                    pass
             history.append((action, next_observation))
             episode_actions.append({
                 "step": step_index + 1,
@@ -212,10 +230,12 @@ def evaluate_environment(env, wrapper, set_canon_fn, device, args, num_games: in
                 break
 
         total_success += success
+        episode_gc = max(goal_condition_values) if goal_condition_values else None
         record = {
             "episode": episode_index,
             "gamefile": gamefile,
             "success": success,
+            "goal_condition_success_rate": episode_gc,
             "steps": len(episode_actions),
             "elapsed_s": time.time() - started,
             "actions": episode_actions,
@@ -228,6 +248,22 @@ def evaluate_environment(env, wrapper, set_canon_fn, device, args, num_games: in
 
     return {
         "acc": total_success / max(num_games, 1),
+        "success_rate": total_success / max(num_games, 1),
+        "goal_condition_success_rate": (
+            float(np.mean([
+                episode["goal_condition_success_rate"]
+                for episode in episodes
+                if episode["goal_condition_success_rate"] is not None
+            ]))
+            if any(episode["goal_condition_success_rate"] is not None for episode in episodes)
+            else None
+        ),
+        "goal_condition_metric_note": (
+            "mean over episodes of the maximum environment-reported "
+            "goal_condition_success_rate"
+            if any(episode["goal_condition_success_rate"] is not None for episode in episodes)
+            else "unavailable: text-only AlfredTWEnv did not expose goal_condition_success_rate"
+        ),
         "em": None,
         "f1": None,
         "n_examples": num_games,
@@ -289,6 +325,7 @@ def main():
         "dual_reader_mode": (
             None if args.condition == "baseline" else args.dual_reader_mode
         ),
+        "reasoning_mode": args.reasoning_mode,
         "dataset": {
             "name": "ALFWorld",
             "environment": "AlfredTWEnv",
@@ -306,6 +343,8 @@ def main():
     result_path.write_text(json.dumps(result, indent=2))
     print("ALFWORLD_MEMORY_EVAL_COMPLETE " + json.dumps({
         "acc": metrics["acc"],
+        "success_rate": metrics["success_rate"],
+        "goal_condition_success_rate": metrics["goal_condition_success_rate"],
         "em": None,
         "f1": None,
         "n_examples": metrics["n_examples"],

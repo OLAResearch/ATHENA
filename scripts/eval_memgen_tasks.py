@@ -67,10 +67,40 @@ def parse_args():
     parser.add_argument("--canon-mode", choices=["vocab", "word_boundary"], default="word_boundary")
     parser.add_argument("--dual-reader-mode", choices=["both", "engram_only", "generated_only"], default="both")
     parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="Start offset into each task's official split; useful for full-data sharding.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--max-context-length", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--prompt-style", choices=["plain", "chat"], default="chat")
+    parser.add_argument(
+        "--reasoning-mode",
+        choices=["vanilla", "cot"],
+        default="vanilla",
+        help="Prompt condition; vanilla is the unchanged backbone and cot requests explicit reasoning.",
+    )
+    parser.add_argument(
+        "--code-num-samples",
+        type=int,
+        default=1,
+        help="Number of code solutions sampled per problem; use 10 for Pass@1/5/10.",
+    )
+    parser.add_argument(
+        "--code-temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature for code solutions when --code-num-samples > 1.",
+    )
+    parser.add_argument(
+        "--code-top-p",
+        type=float,
+        default=0.95,
+        help="Nucleus threshold for sampled code solutions.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -399,11 +429,20 @@ def _paper_math_accuracy(completion: str, ground_truth: str) -> float:
         return 0.0
 
 
-def _extract_short_answer(task: str, text: str) -> str:
-    text = text.strip()
+def _extract_short_answer(task: str, text: str, reasoning_mode: str = "vanilla") -> str:
+    text = (text or "").strip()
+    # A decoder can legally return an empty completion (for example after an
+    # immediate EOS).  Keep the benchmark loop alive and let the metric
+    # functions score it as incorrect instead of indexing an empty list.
+    if not text:
+        return ""
     answer_matches = re.findall(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
     if answer_matches:
         text = answer_matches[-1].strip()
+        # The model can emit an empty answer tag even when the surrounding
+        # completion is non-empty.  Treat it exactly like an empty completion.
+        if not text:
+            return ""
     boxed = _last_boxed(text)
     if task == "math" and boxed:
         return boxed
@@ -411,7 +450,40 @@ def _extract_short_answer(task: str, text: str) -> str:
         numbers = re.findall(r"-?\d[\d,]*(?:\.\d+)?", boxed or text)
         if numbers:
             return numbers[-1].replace(",", "")
-    return text.splitlines()[0].strip()
+    if reasoning_mode == "cot" and task in {"triviaqa", "popqa"}:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            return re.sub(r"^(?:final answer|answer)\s*:\s*", "", lines[-1], flags=re.I).strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[0] if lines else ""
+
+
+def _build_instruction(task: str, example: dict, reasoning_mode: str) -> str:
+    if task in {"triviaqa", "popqa"}:
+        if reasoning_mode == "cot":
+            return (
+                "Solve the question step by step, then put only the concise final answer "
+                "inside <answer></answer>.\n"
+                f"Question: {example['question']}"
+            )
+        return f"Answer the following question concisely.\nQuestion: {example['question']}"
+    if reasoning_mode == "cot":
+        prefix = "Solve the problem step by step and put the final answer in \\boxed{}."
+    else:
+        prefix = "Give the final answer in \\boxed{} without unnecessary text."
+    if task in {"gsm8k", "math"}:
+        return f"{prefix}\nProblem: {example['question']}"
+    if task == "gpqa":
+        labels = "ABCD"
+        choices_text = "\n".join(f"{labels[i]}. {choice}" for i, choice in enumerate(example["choices"]))
+        return f"{prefix}\nQuestion: {example['question']}\n{choices_text}"
+    if task in {"kodcode", "bigcodebench"}:
+        return (
+            ("Reason carefully before writing the solution. " if reasoning_mode == "cot" else "")
+            + "Write a correct Python solution. Return only Python code without Markdown fences.\n"
+            + example["question"]
+        )
+    raise ValueError(task)
 
 
 def evaluate_generation_task(task, examples, wrapper, set_canon_fn, device, args):
@@ -420,14 +492,15 @@ def evaluate_generation_task(task, examples, wrapper, set_canon_fn, device, args
     default_tokens = {"triviaqa": 32, "popqa": 32, "gsm8k": 256, "math": 384}[task]
     max_new_tokens = args.max_new_tokens or default_tokens
     acc_values, em_values, f1_values, samples = [], [], [], []
-    for example in examples:
-        if task in {"triviaqa", "popqa"}:
-            instruction = f"Answer the following question concisely.\nQuestion: {example['question']}"
-        else:
-            instruction = (
-                "Solve the problem step by step and put the final answer in \\boxed{}.\n"
-                f"Problem: {example['question']}"
+    task_started_at = time.monotonic()
+    for example_index, example in enumerate(examples, 1):
+        if example_index == 1 or example_index % 10 == 0:
+            print(
+                f"TASK_ITEM_START {task} {example_index}/{len(examples)} "
+                f"elapsed_s={time.monotonic() - task_started_at:.1f}",
+                flush=True,
             )
+        instruction = _build_instruction(task, example, args.reasoning_mode)
         prompt = build_prompt(tokenizer, instruction, args.prompt_style)
         raw = greedy_generate(
             wrapper, tokenizer, prompt, device, set_canon_fn,
@@ -436,7 +509,7 @@ def evaluate_generation_task(task, examples, wrapper, set_canon_fn, device, args
             official_tokenization=True,
             stop_at_newline=False,
         )
-        prediction = _extract_short_answer(task, raw)
+        prediction = _extract_short_answer(task, raw, args.reasoning_mode)
         em, f1 = _best_text_metrics(prediction, example["answers"])
         if task in {"triviaqa", "popqa"}:
             acc = _paper_alias_accuracy(prediction, example["answers"])
@@ -447,6 +520,8 @@ def evaluate_generation_task(task, examples, wrapper, set_canon_fn, device, args
         f1_values.append(f1)
         if len(samples) < 10:
             samples.append({"question": example["question"], "prediction": prediction, "raw": raw, "answers": example["answers"]})
+        if example_index % 100 == 0 or example_index == len(examples):
+            print(f"TASK_PROGRESS {task} {example_index}/{len(examples)}", flush=True)
     acc = float(np.mean(acc_values)) if acc_values else 0.0
     em = float(np.mean(em_values)) if em_values else 0.0
     return {
@@ -454,9 +529,9 @@ def evaluate_generation_task(task, examples, wrapper, set_canon_fn, device, args
         "em": em,
         "f1": float(np.mean(f1_values)) if f1_values else 0.0,
         "metric_note": (
-            "acc uses MemGen case-insensitive answer-alias containment"
+            "acc uses case-insensitive answer-alias containment"
             if task in {"triviaqa", "popqa"}
-            else "acc uses MemGen first-boxed prediction vs last-boxed reference normalization"
+            else "acc uses first-boxed prediction vs last-boxed reference normalization"
         ),
         "total": len(examples),
         "samples": samples,
@@ -468,13 +543,15 @@ def evaluate_gpqa(examples, wrapper, set_canon_fn, device, args):
     max_context = get_model_max_context(wrapper, args.max_context_length)
     correct, f1_values, samples = 0, [], []
     labels = "ABCD"
-    for example in examples:
-        choices_text = "\n".join(f"{labels[i]}. {choice}" for i, choice in enumerate(example["choices"]))
-        instruction = (
-            "Solve the problem with proper reasoning, and put the final choice "
-            "inside \\boxed{}.\n"
-            f"Question: {example['question']}\n{choices_text}"
-        )
+    task_started_at = time.monotonic()
+    for example_index, example in enumerate(examples, 1):
+        if example_index == 1 or example_index % 10 == 0:
+            print(
+                f"TASK_ITEM_START gpqa {example_index}/{len(examples)} "
+                f"elapsed_s={time.monotonic() - task_started_at:.1f}",
+                flush=True,
+            )
+        instruction = _build_instruction("gpqa", example, args.reasoning_mode)
         prompt = build_prompt(tokenizer, instruction, args.prompt_style)
         raw = greedy_generate(
             wrapper, tokenizer, prompt, device, set_canon_fn,
@@ -492,12 +569,14 @@ def evaluate_gpqa(examples, wrapper, set_canon_fn, device, args):
         f1_values.append(f1_score(prediction, example["answer"])[0])
         if len(samples) < 10:
             samples.append({"question": example["question"], "prediction": prediction, "raw": raw, "answer": example["answer"]})
+        if example_index % 25 == 0 or example_index == len(examples):
+            print(f"TASK_PROGRESS gpqa {example_index}/{len(examples)}", flush=True)
     acc = correct / len(examples) if examples else 0.0
     return {
         "acc": acc,
         "em": acc,
         "f1": float(np.mean(f1_values)) if f1_values else 0.0,
-        "metric_note": "acc uses MemGen boxed-choice correctness on GPQA Diamond",
+        "metric_note": "acc uses boxed-choice correctness on GPQA Diamond",
         "total": len(examples),
         "samples": samples,
     }
@@ -512,32 +591,56 @@ def evaluate_code_generation(task, examples, wrapper, set_canon_fn, device, args
     tokenizer = wrapper.tokenizer
     max_context = get_model_max_context(wrapper, args.max_context_length)
     max_new_tokens = args.max_new_tokens or 768
+    num_samples = int(args.code_num_samples)
+    if num_samples < 1:
+        raise ValueError("--code-num-samples must be at least 1")
+    if num_samples > 1 and args.code_temperature <= 0:
+        raise ValueError("--code-temperature must be positive when sampling multiple code solutions")
     lexical_em, lexical_f1, records = [], [], []
-    for example in examples:
-        instruction = (
-            "Write a correct Python solution. Return only Python code without Markdown fences.\n"
-            + example["question"]
-        )
+    task_started_at = time.monotonic()
+    for example_index, example in enumerate(examples, 1):
+        if example_index == 1 or example_index % 10 == 0:
+            print(
+                f"TASK_ITEM_START {task} {example_index}/{len(examples)} "
+                f"elapsed_s={time.monotonic() - task_started_at:.1f}",
+                flush=True,
+            )
+        instruction = _build_instruction(task, example, args.reasoning_mode)
         prompt = build_prompt(tokenizer, instruction, args.prompt_style)
-        raw = greedy_generate(
-            wrapper, tokenizer, prompt, device, set_canon_fn,
-            max_new_tokens=max_new_tokens,
-            max_context_length=max_context,
-            official_tokenization=True,
-            stop_at_newline=False,
-        )
-        prediction = _strip_code_fence(raw)
+        raw_generations = []
+        predictions = []
+        for _ in range(num_samples):
+            raw = greedy_generate(
+                wrapper, tokenizer, prompt, device, set_canon_fn,
+                max_new_tokens=max_new_tokens,
+                max_context_length=max_context,
+                official_tokenization=True,
+                stop_at_newline=False,
+                temperature=(args.code_temperature if num_samples > 1 else 0.0),
+                top_p=(args.code_top_p if num_samples > 1 else 1.0),
+            )
+            raw_generations.append(raw)
+            predictions.append(_strip_code_fence(raw))
+        prediction = predictions[0]
         reference = example["reference"]
         em, f1 = _best_text_metrics(prediction, [reference])
         lexical_em.append(em)
         lexical_f1.append(f1)
         record = dict(example)
-        record.update({"prediction": prediction, "raw_generation": raw})
+        record.update({
+            "prediction": prediction,
+            "raw_generation": raw_generations[0],
+            "predictions": predictions,
+            "raw_generations": raw_generations,
+            "num_samples": num_samples,
+        })
         if task == "bigcodebench":
             # Official BigCodeBench local evaluation accepts one full
             # self-contained solution per task under the ``solution`` key.
             record["solution"] = prediction
         records.append(record)
+        if example_index % 50 == 0 or example_index == len(examples):
+            print(f"TASK_PROGRESS {task} {example_index}/{len(examples)}", flush=True)
     samples_path = output_dir / f"{task}_samples.jsonl"
     with open(samples_path, "w") as handle:
         for record in records:
@@ -550,6 +653,8 @@ def evaluate_code_generation(task, examples, wrapper, set_canon_fn, device, args
         "f1": float(np.mean(lexical_f1)) if lexical_f1 else 0.0,
         "metric_note": "EM/F1 are lexical diagnostics; acc awaits isolated functional execution",
         "total": len(examples),
+        "num_samples": num_samples,
+        "pass_k": [k for k in (1, 5, 10) if num_samples >= k],
         "samples_file": str(samples_path),
     }
 
@@ -574,6 +679,10 @@ def load_task(task: str, seed: int):
 
 def main():
     args = parse_args()
+    if args.code_num_samples < 1:
+        raise ValueError("--code-num-samples must be at least 1")
+    if not 0 < args.code_top_p <= 1:
+        raise ValueError("--code-top-p must be in (0, 1]")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -595,9 +704,19 @@ def main():
     for task in args.tasks:
         examples, dataset_meta = load_task(task, args.seed)
         full_count = len(examples)
+        if args.start_index < 0 or args.start_index > full_count:
+            raise ValueError(
+                f"--start-index {args.start_index} is outside {task} split of {full_count} examples"
+            )
+        shard_start = args.start_index
+        examples = examples[shard_start:]
         if args.max_examples is not None:
             examples = examples[: args.max_examples]
-        print(f"TASK_START {task} examples={len(examples)}/{full_count} source={dataset_meta}")
+        shard_end = shard_start + len(examples)
+        print(
+            f"TASK_START {task} examples={len(examples)}/{full_count} "
+            f"slice=[{shard_start}:{shard_end}] source={dataset_meta}"
+        )
         started = time.time()
         if task == "gpqa":
             metrics = evaluate_gpqa(examples, wrapper, set_canon_fn, device, args)
@@ -606,7 +725,14 @@ def main():
         else:
             metrics = evaluate_generation_task(task, examples, wrapper, set_canon_fn, device, args)
         metrics["elapsed_s"] = time.time() - started
-        results[task] = {"dataset": dataset_meta, "full_count": full_count, "evaluated_count": len(examples), "metrics": metrics}
+        results[task] = {
+            "dataset": dataset_meta,
+            "full_count": full_count,
+            "evaluated_count": len(examples),
+            "slice_start": shard_start,
+            "slice_end": shard_end,
+            "metrics": metrics,
+        }
         print(f"TASK_COMPLETE {task} {json.dumps(metrics, default=str)}")
 
     final = {
@@ -620,13 +746,14 @@ def main():
         "dual_reader_mode": (
             None if args.condition == "baseline" else args.dual_reader_mode
         ),
+        "reasoning_mode": args.reasoning_mode,
         "tasks": results,
         "completed": True,
     }
     with open(result_path, "w") as handle:
         json.dump(final, handle, indent=2)
     wrapper.cleanup()
-    print("MEMGEN_STATIC_TASK_EVAL_COMPLETE")
+    print("STATIC_TASK_EVAL_COMPLETE")
 
 
 if __name__ == "__main__":

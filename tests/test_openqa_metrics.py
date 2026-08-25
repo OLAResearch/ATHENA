@@ -2,11 +2,31 @@ from scripts.eval_openqa import (
     compute_truthfulqa_mc_scores,
     exact_match,
     f1_score,
+    load_triviaqa_examples,
     normalize_answer,
     task_scalar_metric,
     task_scalar_score,
     use_official_tokenization,
 )
+
+
+def test_triviaqa_loader_is_pinned_to_full_validation_config(monkeypatch):
+    calls = {}
+
+    def fake_loader(*, candidates, split_candidates):
+        calls["candidates"] = candidates
+        calls["splits"] = split_candidates
+        return ([{"question": "q", "answer": "answer"}], {"split": "validation"})
+
+    monkeypatch.setattr("scripts.eval_openqa.load_dataset_with_fallback", fake_loader)
+    examples, meta = load_triviaqa_examples()
+
+    assert examples == [{"question": "q", "answers": ["answer"]}]
+    assert calls == {
+        "candidates": [("mandarjoshi/trivia_qa", "rc.nocontext")],
+        "splits": ["validation"],
+    }
+    assert meta == {"split": "validation"}
 
 
 def test_normalize_answer_removes_articles_punctuation_and_case():

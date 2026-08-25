@@ -18,6 +18,7 @@ import sys
 import tempfile
 import ast
 import re
+import math
 from pathlib import Path
 
 
@@ -36,6 +37,45 @@ def parse_args():
 def read_jsonl(path: str) -> list[dict]:
     with open(path) as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def prediction_samples(record: dict) -> list[str]:
+    """Return all generated solutions while preserving old one-sample files."""
+    values = record.get("predictions")
+    if isinstance(values, list) and values:
+        return [str(value) for value in values]
+    if "prediction" in record:
+        return [str(record["prediction"])]
+    if "solution" in record:
+        return [str(record["solution"])]
+    raise KeyError(f"Code record has no prediction/solution: {record.keys()}")
+
+
+def estimate_pass_at_k(num_samples: int, num_correct: int, k: int) -> float | None:
+    """Unbiased pass@k estimator used by HumanEval/BigCodeBench.
+
+    A value is undefined when fewer than k samples were generated for a
+    problem, so callers receive ``None`` instead of a misleading zero.
+    """
+    if num_samples < k:
+        return None
+    if num_samples - num_correct < k:
+        return 1.0
+    return float(1.0 - math.prod(
+        1.0 - k / value
+        for value in range(num_samples - num_correct + 1, num_samples + 1)
+    ))
+
+
+def summarize_pass_at_k(counts: list[tuple[int, int]]) -> dict[str, float | None]:
+    return {
+        f"pass@{k}": (
+            float(sum(value for value in values) / len(values))
+            if (values := [estimate_pass_at_k(n, c, k) for n, c in counts if n >= k])
+            else None
+        )
+        for k in (1, 5, 10)
+    }
 
 
 def _limit_child(cpu_seconds: int):
@@ -163,27 +203,57 @@ def evaluate_kodcode_record(record: dict, timeout: int) -> dict:
     }
 
 
+def evaluate_kodcode_candidate(record: dict, prediction: str, sample_index: int, timeout: int) -> dict:
+    candidate = dict(record)
+    candidate["prediction"] = prediction
+    result = evaluate_kodcode_record(candidate, timeout)
+    result["sample_index"] = sample_index
+    return result
+
+
 def evaluate_kodcode(records: list[dict], output_dir: Path, parallel: int, timeout: int):
     results = []
+    task_counts = []
+    candidate_jobs = []
+    for record in records:
+        candidates = prediction_samples(record)
+        task_counts.append((record["task_id"], len(candidates)))
+        candidate_jobs.extend(
+            (record, prediction, index)
+            for index, prediction in enumerate(candidates)
+        )
     # A process pool avoids combining fork/preexec resource setup with a
     # multi-threaded parent process.
     with concurrent.futures.ProcessPoolExecutor(max_workers=parallel) as executor:
-        futures = [executor.submit(evaluate_kodcode_record, record, timeout) for record in records]
+        futures = [
+            executor.submit(evaluate_kodcode_candidate, record, prediction, index, timeout)
+            for record, prediction, index in candidate_jobs
+        ]
         for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
             result = future.result()
             results.append(result)
             print(
-                f"KODCODE_FUNCTIONAL_COMPLETE {index}/{len(records)} "
-                f"{result['task_id']} {result['status']}"
+                f"KODCODE_FUNCTIONAL_COMPLETE {index}/{len(candidate_jobs)} "
+                f"{result['task_id']} sample={result['sample_index']} {result['status']}"
             )
     results.sort(key=lambda item: item["task_id"])
     (output_dir / "kodcode_execution_results.json").write_text(
         json.dumps(results, indent=2)
     )
     passed = sum(int(result["passed"]) for result in results)
-    return passed / len(results) if results else 0.0, {
+    by_task = {}
+    for result in results:
+        by_task.setdefault(result["task_id"], []).append(int(result["passed"]))
+    counts = [(len(values), sum(values)) for values in by_task.values()]
+    pass_at_k = summarize_pass_at_k(counts)
+    pass1 = pass_at_k["pass@1"]
+    return pass1 if pass1 is not None else 0.0, {
         "passed": passed,
         "total": len(results),
+        "problem_count": len(by_task),
+        "test_pass_rate": passed / len(results) if results else 0.0,
+        "pass_at_k": pass_at_k,
+        "samples_per_problem": sorted({len(values) for values in by_task.values()}),
         "evaluator": "pytest_subprocess_inside_networkless_apptainer",
     }
 
@@ -192,19 +262,26 @@ def evaluate_bigcodebench(records: list[dict], output_dir: Path, parallel: int):
     official_samples = output_dir / "bigcodebench_official_samples.jsonl"
     with open(official_samples, "w") as handle:
         for record in records:
-            handle.write(json.dumps({
-                "task_id": record["task_id"],
-                "solution": record.get("solution", record["prediction"]),
-            }) + "\n")
+            for solution in prediction_samples(record):
+                handle.write(json.dumps({
+                    "task_id": record["task_id"],
+                    "solution": solution,
+                }) + "\n")
 
     from bigcodebench.evaluate import evaluate
 
+    sample_counts = [len(prediction_samples(record)) for record in records]
+    requested_k = [1]
+    if sample_counts and min(sample_counts) >= 5:
+        requested_k.append(5)
+    if sample_counts and min(sample_counts) >= 10:
+        requested_k.append(10)
     evaluate(
         split="instruct",
         subset="full",
         samples=str(official_samples),
         execution="local",
-        pass_k="1",
+        pass_k=",".join(str(k) for k in requested_k),
         save_pass_rate=True,
         calibrated=False,
         parallel=parallel,
@@ -215,8 +292,13 @@ def evaluate_bigcodebench(records: list[dict], output_dir: Path, parallel: int):
     if not pass_path.is_file() or not eval_path.is_file():
         raise FileNotFoundError("Official BigCodeBench evaluator did not emit expected outputs")
     pass_data = json.loads(pass_path.read_text())
+    pass_at_k = {f"pass@{k}": pass_data.get(f"pass@{k}") for k in (1, 5, 10)}
     return float(pass_data["pass@1"]), {
         "total": len(records),
+        "total_solutions": sum(sample_counts),
+        "samples_per_problem": sorted(set(sample_counts)),
+        "pass_at_k": pass_at_k,
+        "requested_pass_k": requested_k,
         "evaluator": "bigcodebench.evaluate local",
         "split": "instruct",
         "subset": "full",
@@ -232,10 +314,15 @@ def update_result_file(path: Path, task: str, acc: float, detail: dict):
     payload = json.loads(path.read_text())
     task_result = payload["tasks"][task]
     task_result["metrics"]["acc"] = acc
+    if "pass_at_k" in detail:
+        task_result["metrics"]["pass_at_k"] = detail["pass_at_k"]
+    if "test_pass_rate" in detail:
+        task_result["metrics"]["test_pass_rate"] = detail["test_pass_rate"]
     task_result["metrics"]["functional_evaluation"] = detail
     note = task_result["metrics"].get("metric_note", "")
     task_result["metrics"]["metric_note"] = (
-        "acc is functional pass@1; EM/F1 remain lexical diagnostics"
+        "acc is functional Pass@1; code test_pass_rate and Pass@1/5/10 are "
+        "reported when enough solutions were generated; EM/F1 remain lexical diagnostics"
         + (f"; previous note: {note}" if note else "")
     )
     path.write_text(json.dumps(payload, indent=2))
@@ -261,6 +348,8 @@ def main():
         "acc": acc,
         "em": None,
         "f1": None,
+        "pass_at_k": detail.get("pass_at_k"),
+        "test_pass_rate": detail.get("test_pass_rate"),
         "detail": detail,
     }
     marker.write_text(json.dumps(summary, indent=2))

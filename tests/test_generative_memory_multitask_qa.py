@@ -15,8 +15,10 @@ class TinyTokenizer:
         return {"input_ids": prefix + [ord(ch) + 2 for ch in text]}
 
 
-def test_joint_task_sets_train_four_and_evaluate_five():
-    assert TRAIN_TASKS == ("nq", "webqa", "triviaqa", "hotpotqa")
+def test_joint_task_sets_include_available_training_splits():
+    assert TRAIN_TASKS == (
+        "nq", "webqa", "triviaqa", "hotpotqa", "gsm8k", "math", "kodcode"
+    )
     assert EVAL_TASKS == ("nq", "webqa", "triviaqa", "truthfulqa", "hotpotqa")
 
 
@@ -27,6 +29,25 @@ def test_extract_training_examples_for_all_four_schemas():
     assert extract_training_example("triviaqa", trivia)["answer"] == "Best"
     assert extract_training_example("hotpotqa", {"question": "Q", "answer": "yes"})["answer"] == "yes"
     assert extract_training_example("nq", {"question": "bad", "answer": [")"]}) is None
+
+
+def test_extract_training_examples_for_math_and_code_schemas():
+    gsm = extract_training_example(
+        "gsm8k", {"question": "Q", "answer": "work\n#### 72"}
+    )
+    assert gsm["answer"] == r"\boxed{72}"
+    assert "Problem: Q" in gsm["prompt"]
+
+    math = extract_training_example(
+        "math", {"problem": "P", "solution": r"reasoning, so \boxed{4}"}
+    )
+    assert math["answer"] == r"\boxed{4}"
+
+    code = extract_training_example(
+        "kodcode", {"question": "write f", "solution": "def f():\n    return 1"}
+    )
+    assert code["answer"].startswith("def f")
+    assert "Python code" in code["prompt"]
 
 
 def test_answer_only_collator_masks_prompt_and_pads():

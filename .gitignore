@@ -7,6 +7,8 @@ REPRODUCE_hit_at_k.md
 *.pdf
 .venv/
 ROIHU_R4_PRESERVED.md
+docker/
+data00/
 data/
 .vscode/
 logs/

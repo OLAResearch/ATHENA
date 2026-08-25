@@ -1,4 +1,4 @@
-"""Jointly supervise the generated branch on four QA training sets.
+"""Jointly supervise the generated branch on the available training splits.
 
 The frozen Mistral backbone, Engram table, and direct Engram reader are reused
 from the existing dual-reader checkpoint.  Only the generator, generated-memory
@@ -39,7 +39,15 @@ from scripts.train_adaptor import get_cosine_schedule_with_warmup
 from scripts.train_generative_memory_qa import configure_generated_branch
 
 
-TRAIN_TASKS = ("nq", "webqa", "triviaqa", "hotpotqa")
+TRAIN_TASKS = (
+    "nq",
+    "webqa",
+    "triviaqa",
+    "hotpotqa",
+    "gsm8k",
+    "math",
+    "kodcode",
+)
 EVAL_TASKS = ("nq", "webqa", "triviaqa", "truthfulqa", "hotpotqa")
 
 TRAIN_SPECS = {
@@ -47,11 +55,93 @@ TRAIN_SPECS = {
     "webqa": ("Stanford/web_questions", None, "train"),
     "triviaqa": ("mandarjoshi/trivia_qa", "rc.nocontext", "train"),
     "hotpotqa": ("hotpotqa/hotpot_qa", "distractor", "train"),
+    "gsm8k": ("openai/gsm8k", "main", "train"),
+    "math": ("DigitalLearningGmbH/MATH-lighteval", None, "train"),
 }
+
+TRAINING_EXCLUSIONS = {
+    "popqa": "official dataset exposes test only",
+    "gpqa": "448-question corpus has no independent train split; avoid leakage into Diamond evaluation",
+    "bigcodebench": "official dataset has no splits; all 1,140 rows are evaluation rows",
+    "alfworld": "interactive valid_unseen evaluation has no supervised split in this text-QA trainer",
+}
+
+
+def _last_boxed_content(text: str) -> str:
+    """Return the content of the last balanced ``\\boxed{...}`` expression."""
+    marker = "\\boxed{"
+    start = text.rfind(marker)
+    if start < 0:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+    index = start + len(marker)
+    depth = 1
+    chars = []
+    while index < len(text) and depth:
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        chars.append(char)
+        index += 1
+    return "".join(chars).strip() if depth == 0 else text[start:].strip()
+
+
+def _training_prompt(task: str, question: str) -> str:
+    if task in {"gsm8k", "math"}:
+        return "Give the final answer in \\boxed{} without unnecessary text.\nProblem: " + question
+    if task == "kodcode":
+        return (
+            "Write a correct Python solution. Return only Python code without Markdown fences.\n"
+            + question
+        )
+    return build_openqa_prompt(question)
 
 
 def extract_training_example(task: str, raw: dict) -> dict | None:
     """Normalize one raw record into question/answer supervision."""
+    if task == "gsm8k":
+        question = str(raw.get("question", "")).strip()
+        answer = str(raw.get("answer", "")).rsplit("####", 1)[-1].strip()
+        if not question or not answer:
+            return None
+        return {
+            "task": task,
+            "question": question,
+            "prompt": _training_prompt(task, question),
+            "answer": "\\boxed{" + answer + "}",
+            "answers": [answer],
+        }
+
+    if task == "math":
+        question = str(raw.get("problem", "")).strip()
+        answer = _last_boxed_content(str(raw.get("solution", "")))
+        if not question or not answer:
+            return None
+        return {
+            "task": task,
+            "question": question,
+            "prompt": _training_prompt(task, question),
+            "answer": "\\boxed{" + answer + "}",
+            "answers": [answer],
+        }
+
+    if task == "kodcode":
+        question = str(raw.get("question", "")).strip()
+        answer = str(raw.get("solution", "")).strip()
+        if not question or not answer:
+            return None
+        return {
+            "task": task,
+            "question": question,
+            "prompt": _training_prompt(task, question),
+            "answer": answer,
+            "answers": [answer],
+        }
+
     answer_value = raw.get("answers", raw.get("answer"))
     answers = dedupe_answers(flatten_answers(answer_value))
     if task == "nq" and ")" in answers:
@@ -70,6 +160,7 @@ def extract_training_example(task: str, raw: dict) -> dict | None:
     return {
         "task": task,
         "question": question,
+        "prompt": _training_prompt(task, question),
         "answer": answer,
         "answers": answers,
     }
@@ -78,8 +169,18 @@ def extract_training_example(task: str, raw: dict) -> dict | None:
 def load_training_task(task: str, max_examples: int | None = None):
     from datasets import load_dataset
 
-    dataset_name, config_name, split = TRAIN_SPECS[task]
-    dataset = load_dataset(dataset_name, config_name, split=split)
+    if task == "kodcode":
+        dataset_name = "KodCode/KodCode-Light-RL-10K"
+        config_name = None
+        source_split = "train"
+        full_dataset = load_dataset(dataset_name, split=source_split)
+        dataset = full_dataset.train_test_split(
+            test_size=0.2, seed=42, shuffle=True
+        )["train"]
+        split = "seeded_80pct_train"
+    else:
+        dataset_name, config_name, split = TRAIN_SPECS[task]
+        dataset = load_dataset(dataset_name, config_name, split=split)
     if max_examples is not None:
         dataset = dataset.select(range(min(max_examples, len(dataset))))
     examples = []
@@ -94,6 +195,12 @@ def load_training_task(task: str, max_examples: int | None = None):
         "raw_count": len(dataset),
         "usable_count": len(examples),
     }
+    if task == "kodcode":
+        source.update({
+            "source_split": source_split,
+            "evaluation_split": "seeded_20pct_test",
+            "seed": 42,
+        })
     return examples, source
 
 
@@ -118,8 +225,8 @@ class AnswerOnlyCollator:
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-    def encode(self, question: str, answer: str):
-        prompt = build_openqa_prompt(question)
+    def encode(self, question: str, answer: str, prompt: str | None = None):
+        prompt = prompt or build_openqa_prompt(question)
         answer_text = " " + answer.strip()
         if self.tokenizer.eos_token:
             answer_text += self.tokenizer.eos_token
@@ -141,7 +248,10 @@ class AnswerOnlyCollator:
         return full_ids, labels
 
     def __call__(self, examples):
-        encoded = [self.encode(ex["question"], ex["answer"]) for ex in examples]
+        encoded = [
+            self.encode(ex["question"], ex["answer"], ex.get("prompt"))
+            for ex in examples
+        ]
         max_len = max(len(ids) for ids, _ in encoded)
         pad_id = self.tokenizer.pad_token_id
         input_batch, label_batch, mask_batch = [], [], []
@@ -161,9 +271,20 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-model", default="mistralai/Mistral-7B-v0.3")
     parser.add_argument("--adaptor-dir", required=True)
+    parser.add_argument(
+        "--adaptor-checkpoint",
+        default=None,
+        help="Optional checkpoint path when the adaptor checkpoint is not in adaptor-dir.",
+    )
     parser.add_argument("--source-memory", required=True)
     parser.add_argument("--memory-config", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--dual-reader-mode",
+        choices=["both", "engram_only", "generated_only"],
+        default="generated_only",
+        help="Reader contribution used during generated-branch training and evaluation.",
+    )
     parser.add_argument("--canon-mode", default="word_boundary", choices=["vocab", "word_boundary"])
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -174,6 +295,13 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=15)
     parser.add_argument("--max-train-examples-per-task", type=int, default=None)
     parser.add_argument("--max-eval-examples", type=int, default=None)
+    parser.add_argument(
+        "--eval-tasks",
+        nargs="+",
+        choices=EVAL_TASKS,
+        default=list(EVAL_TASKS),
+        help="Generation-evaluate only these tasks after training.",
+    )
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -183,7 +311,7 @@ def evaluate_all_tasks(wrapper, set_canon_fn, device, args):
     tokenizer = wrapper.tokenizer
     max_context = get_model_max_context(wrapper, None)
     all_results = {}
-    for task in EVAL_TASKS:
+    for task in args.eval_tasks:
         examples, dataset_meta = TASK_LOADERS[task]()
         if args.max_eval_examples is not None:
             examples = examples[: args.max_eval_examples]
@@ -231,8 +359,21 @@ def main():
     results_file = output_dir / "results.json"
     if results_file.exists():
         raise FileExistsError(f"Refusing to overwrite {results_file}")
+    # Keep the runtime architecture metadata next to the trained checkpoint.
+    # The input dual-reader checkpoint predates this task-supervision script,
+    # so its config is the authoritative source for injection and reader
+    # construction parameters.  Merge CLI values on top without dropping
+    # those fields; downstream evaluators can then load this directory
+    # directly with the same generated-only reader mode.
+    input_runtime_config = {}
+    input_config_path = Path(args.adaptor_dir) / "config.json"
+    if input_config_path.exists():
+        with open(input_config_path) as handle:
+            input_runtime_config = json.load(handle)
+    runtime_config = dict(input_runtime_config)
+    runtime_config.update(vars(args))
     with open(output_dir / "config.json", "w") as handle:
-        json.dump(vars(args), handle, indent=2)
+        json.dump(runtime_config, handle, indent=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -321,12 +462,14 @@ def main():
     wrapper.eval()
     evaluation = evaluate_all_tasks(wrapper, set_canon_fn, device, args)
     results = {
-        "objective": "joint_answer_only_cross_entropy",
+        "objective": "joint_answer_and_code_only_cross_entropy",
         "train_tasks": list(TRAIN_TASKS),
-        "eval_tasks": list(EVAL_TASKS),
+        "eval_tasks": list(args.eval_tasks),
         "frozen": ["backbone", "engram_table", "engram_reader"],
         "trainable": ["generator", "generated_reader", "generated_gate"],
+        "dual_reader_mode": args.dual_reader_mode,
         "training_sources": train_dataset.sources,
+        "training_exclusions": TRAINING_EXCLUSIONS,
         "train_size": len(train_dataset),
         "first_loss": first_loss,
         "final_batch_loss": final_loss,

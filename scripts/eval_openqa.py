@@ -26,9 +26,13 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
+import os
 import random
 import re
+import subprocess
+import sys
 import string
 import time
 from collections import Counter
@@ -40,8 +44,6 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoTokenizer
-
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -93,9 +95,30 @@ def parse_args():
                         help="Optional checkpoint override while retaining adaptor-dir runtime config")
     parser.add_argument(
         "--dual-reader-mode",
-        choices=["both", "engram_only", "generated_only"],
-        default="both",
-        help="Runtime-only dual-reader ablation; generated_only still uses Engram cues",
+        choices=[
+            "auto",
+            "both",
+            "engram_only",
+            "generated_only",
+            "routed",
+            "generated_from_engram_only",
+            "generated_from_context_only",
+            "e_ge",
+            "e_gh",
+            "ge_gh",
+            "tri_routed",
+            "tri_soft_fused",
+            "tri_safe_routed",
+            "tri_subset_routed",
+            "tri_subset_soft_fused",
+            "tri_advantage_routed",
+        ],
+        default="auto",
+        help=(
+            "Runtime reader mode. auto uses checkpoint deployment metadata, "
+            "then known training flags; legacy checkpoints keep the historical "
+            "default. Explicit modes are never overridden."
+        ),
     )
     parser.add_argument("--source-memory", type=str, default="results/source_memory/memory.pt")
     parser.add_argument("--memory-config", type=str, default="results/source_memory/memory_config.json")
@@ -127,6 +150,24 @@ def parse_args():
     parser.add_argument("--max-context-length", type=int, default=None,
                         help="Override model max context during eval")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--parallel-tasks",
+        type=int,
+        default=1,
+        help=(
+            "Evaluate tasks in isolated subprocesses (one model per worker). "
+            "Values <=1 preserve the historical sequential path."
+        ),
+    )
+    parser.add_argument(
+        "--task-devices",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated CUDA device ids for --parallel-tasks. Devices are "
+            "assigned round-robin; defaults to the current CUDA visibility."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing openqa_results.json in output-dir")
     parser.add_argument("--output-dir", type=str, required=True)
@@ -348,6 +389,56 @@ def build_openqa_prompt(question: str, reasoning_mode: str = "vanilla") -> str:
     return f"Answer these questions:\nQuestion: {question_text}\nAnswer:"
 
 
+def truncate_openqa_prediction(prediction: str) -> str:
+    """Stop before a continuation begins another QA item."""
+    first_line = prediction.split("\n", 1)[0]
+    return re.split(
+        r"\s*(?:;\s*)?(?:Question|Q)\s*:",
+        first_line,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+
+
+def _adjacent_repeated_ngram_count(tokens: list[str], n: int) -> int:
+    if n < 1 or len(tokens) < 2 * n:
+        return 0
+    return sum(
+        1
+        for index in range(len(tokens) - 2 * n + 1)
+        if tokens[index : index + n] == tokens[index + n : index + 2 * n]
+    )
+
+
+def prediction_diagnostics(raw_prediction: str, extracted_prediction: str) -> dict:
+    """Describe generated text without participating in any QA score."""
+    raw_tokens = raw_prediction.split()
+    extracted_tokens = extracted_prediction.split()
+
+    def describe(tokens: list[str], text: str) -> dict:
+        repeated = {
+            f"adjacent_repeated_{n}gram_count": _adjacent_repeated_ngram_count(
+                tokens, n
+            )
+            for n in (1, 2, 3)
+        }
+        repeated_total = sum(repeated.values())
+        return {
+            "length_chars": len(text),
+            "length_tokens": len(tokens),
+            **repeated,
+            "repetition_count": repeated_total,
+            "has_repetition": bool(repeated_total),
+        }
+
+    return {
+        "raw": describe(raw_tokens, raw_prediction),
+        "extracted": describe(extracted_tokens, extracted_prediction),
+        "raw_equals_extracted": raw_prediction == extracted_prediction,
+        "extraction_changed": raw_prediction != extracted_prediction,
+    }
+
+
 def build_truthfulqa_demo() -> str:
     qa_pairs = [
         ("What is human life expectancy in the United States?",
@@ -399,11 +490,6 @@ def f1_score(prediction: str, ground_truth: str) -> tuple[float, float, float]:
     normalized_prediction = normalize_answer(prediction)
     normalized_ground_truth = normalize_answer(ground_truth)
 
-    if normalized_ground_truth in {"yes", "no", "noanswer"}:
-        if normalized_ground_truth in normalized_prediction:
-            return 1.0, 1.0, 1.0
-        return 0.0, 0.0, 0.0
-
     prediction_tokens = normalized_prediction.split()
     ground_truth_tokens = normalized_ground_truth.split()
     common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
@@ -414,6 +500,62 @@ def f1_score(prediction: str, ground_truth: str) -> tuple[float, float, float]:
     recall = num_same / len(ground_truth_tokens)
     f1 = (2 * precision * recall) / (precision + recall)
     return f1, precision, recall
+
+
+def _reader_adaptors(wrapper):
+    """Return adaptor modules without assuming singleton or ModuleList layout."""
+    if wrapper.adaptor is None:
+        return []
+    if isinstance(wrapper.adaptor, torch.nn.ModuleList):
+        return list(wrapper.adaptor)
+    return [wrapper.adaptor]
+
+
+def configure_advantage_reader(wrapper, advantage_reader: Optional[dict]) -> bool:
+    """Materialize a lazy advantage head before loading a strict checkpoint.
+
+    The advantage reader is deliberately configured per adaptor because a
+    checkpoint may contain either a singleton adaptor or a layer-indexed
+    ``ModuleList``.  Only the public runtime controls are forwarded; metadata
+    added by a trainer is retained in ``config.json`` but cannot accidentally
+    become an unsupported keyword argument.
+    """
+    if advantage_reader is None:
+        return False
+    if not isinstance(advantage_reader, dict):
+        raise TypeError("config['advantage_reader'] must be a dictionary")
+    if not advantage_reader.get("enabled", True):
+        return False
+    adaptors = _reader_adaptors(wrapper)
+    if not adaptors:
+        raise ValueError(
+            "config['advantage_reader'] requires a generative adaptor checkpoint"
+        )
+
+    values = {
+        "candidates": advantage_reader.get("candidates", "sources"),
+        "threshold": float(advantage_reader.get("threshold", 0.0)),
+        "confidence_threshold": float(
+            advantage_reader.get("confidence_threshold", 0.5)
+        ),
+        "temperature": float(advantage_reader.get("temperature", 0.15)),
+        "max_scale": float(advantage_reader.get("max_scale", 1.0)),
+    }
+    if values["candidates"] not in {"sources", "subsets"}:
+        raise ValueError(
+            "advantage_reader.candidates must be 'sources' or 'subsets'"
+        )
+    for adaptor in adaptors:
+        configure = getattr(adaptor, "configure_advantage_reader", None)
+        if configure is None:
+            raise AttributeError(
+                f"{type(adaptor).__name__} does not support advantage_reader"
+            )
+        # This call is intentionally before the checkpoint load in
+        # ``setup_wrapper``.  The core implementation lazily registers the
+        # head, so its tensors are then part of the strict expected state.
+        configure(**values)
+    return True
 
 
 def get_model_max_context(wrapper: BackboneWrapper, override: Optional[int]) -> int:
@@ -452,6 +594,15 @@ def setup_wrapper(
     generator_heads: int = 4,
     generator_cue_window: int = 3,
     generator_fusion_type: str = "generated_only",
+    generator_adaptive_router: bool = False,
+    generator_router_hidden_size: int = 16,
+    generator_router_semantic_size: int = 0,
+    generator_router_expert_mode: str = "residual",
+    generator_source_adapter_rank: int = 16,
+    generator_loop_rounds: int = 1,
+    generator_loop_workspace_size: int = 0,
+    generator_loop_gate_max: float = 0.25,
+    advantage_reader: Optional[dict] = None,
 ) -> BackboneWrapper:
     wrapper = BackboneWrapper(
         model_name=model_name,
@@ -471,6 +622,14 @@ def setup_wrapper(
         generator_heads=generator_heads,
         generator_cue_window=generator_cue_window,
         generator_fusion_type=generator_fusion_type,
+        generator_adaptive_router=generator_adaptive_router,
+        generator_router_hidden_size=generator_router_hidden_size,
+        generator_router_semantic_size=generator_router_semantic_size,
+        generator_router_expert_mode=generator_router_expert_mode,
+        generator_source_adapter_rank=generator_source_adapter_rank,
+        generator_loop_rounds=generator_loop_rounds,
+        generator_loop_workspace_size=generator_loop_workspace_size,
+        generator_loop_gate_max=generator_loop_gate_max,
     )
     wrapper.tokenizer.padding_side = "left"
     if wrapper.tokenizer.pad_token_id is None and wrapper.tokenizer.eos_token_id is not None:
@@ -480,9 +639,12 @@ def setup_wrapper(
         generation_config = getattr(wrapper.backbone, "generation_config", None)
         if generation_config is not None:
             generation_config.pad_token_id = wrapper.tokenizer.pad_token_id
+    # The advantage head is lazy by design.  It must exist before a strict
+    # state-dict load, otherwise a valid new checkpoint appears incomplete.
+    configure_advantage_reader(wrapper, advantage_reader)
     if adaptor_path and Path(adaptor_path).exists() and wrapper.adaptor is not None:
         state_dict = torch.load(adaptor_path, map_location="cpu", weights_only=True)
-        wrapper.adaptor.load_state_dict(state_dict)
+        wrapper.adaptor.load_state_dict(state_dict, strict=True)
         wrapper.adaptor.to(device)
     wrapper.eval()
     return wrapper
@@ -556,6 +718,186 @@ def load_adaptor_runtime_config(adaptor_dir: str) -> dict:
         return json.load(f)
 
 
+def _is_tri_reader_config(adaptor_cfg: dict) -> bool:
+    return (
+        adaptor_cfg.get("generator_fusion_type") == "tri_reader"
+        or adaptor_cfg.get("fusion_type") == "tri_reader"
+        or any(
+            bool(adaptor_cfg.get(key))
+            for key in (
+                "joint_tri_reader",
+                "joint_tri_subset_reader",
+                "joint_tri_route_only",
+            )
+        )
+    )
+
+
+def resolve_reader_mode_contract(
+    requested_mode: str,
+    adaptor_cfg: Optional[dict] = None,
+    *,
+    condition: str = "transferred",
+) -> dict:
+    """Resolve an evaluator reader mode and record why it was selected.
+
+    ``auto`` is intentionally resolved from deployment metadata first.  The
+    training flags are only a compatibility fallback for checkpoints written
+    before ``deployment_reader_mode`` was persisted.  A checkpoint without
+    either form of metadata uses the historical mode: ``both`` for legacy
+    dual readers and hard ``tri_routed`` for legacy tri readers.
+    """
+    requested_mode = requested_mode or "auto"
+    adaptor_cfg = adaptor_cfg or {}
+    if condition == "baseline":
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": None,
+            "reader_mode_provenance": "baseline_bare_backbone",
+        }
+    if requested_mode != "auto":
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": requested_mode,
+            "reader_mode_provenance": "explicit_cli",
+        }
+
+    # Advantage-reader checkpoints carry a stronger deployment contract than
+    # legacy tri routing metadata.  Prefer it when older configs still retain
+    # ``tri_routed``/``tri_soft_fused`` flags from the source expert run.
+    advantage_reader = adaptor_cfg.get("advantage_reader")
+    if isinstance(advantage_reader, dict) and advantage_reader.get("enabled"):
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": "tri_advantage_routed",
+            "reader_mode_provenance": "checkpoint.advantage_reader",
+        }
+
+    deployment = adaptor_cfg.get("deployment_reader_mode")
+    if deployment and deployment != "auto":
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": str(deployment),
+            "reader_mode_provenance": "checkpoint.deployment_reader_mode",
+        }
+
+    if bool(adaptor_cfg.get("joint_tri_route_only")):
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": "tri_soft_fused",
+            "reader_mode_provenance": "checkpoint.training_flags.joint_tri_route_only",
+        }
+    if bool(adaptor_cfg.get("joint_tri_subset_reader")):
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": "tri_subset_soft_fused",
+            "reader_mode_provenance": "checkpoint.training_flags.joint_tri_subset_reader",
+        }
+    if bool(adaptor_cfg.get("joint_tri_reader")):
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": "tri_routed",
+            "reader_mode_provenance": "checkpoint.training_flags.joint_tri_reader",
+        }
+
+    training = adaptor_cfg.get("training_reader_mode")
+    if training and training != "auto":
+        return {
+            "requested_reader_mode": requested_mode,
+            "effective_reader_mode": str(training),
+            "reader_mode_provenance": "checkpoint.training_reader_mode",
+        }
+
+    return {
+        "requested_reader_mode": requested_mode,
+        "effective_reader_mode": "tri_routed" if _is_tri_reader_config(adaptor_cfg) else "both",
+        "reader_mode_provenance": "legacy_default",
+    }
+
+
+def resolve_reader_mode(
+    requested_mode: str,
+    adaptor_cfg: Optional[dict] = None,
+    *,
+    condition: str = "transferred",
+) -> Optional[str]:
+    """Return only the effective mode for callers that do not need provenance."""
+    return resolve_reader_mode_contract(
+        requested_mode, adaptor_cfg, condition=condition
+    )["effective_reader_mode"]
+
+
+def _apply_reader_mode(wrapper, mode: Optional[str]) -> Optional[str]:
+    """Apply a resolved mode and return the actual runtime mode."""
+    if mode is None:
+        return None
+    applied = mode
+    for adaptor in _reader_adaptors(wrapper):
+        tri_setter = getattr(adaptor, "set_tri_reader_mode", None)
+        is_tri = tri_setter is not None and getattr(
+            adaptor, "fusion_type", None
+        ) == "tri_reader"
+        if is_tri:
+            # ``both`` was the historical dual-reader spelling.  A tri reader
+            # has no literal ``both`` path; retain the explicit alias by using
+            # its soft all-source endpoint.
+            applied = "tri_soft_fused" if mode == "both" else mode
+            tri_setter(applied)
+        else:
+            setter = getattr(adaptor, "set_dual_reader_mode", None)
+            if mode == "both" and setter is None:
+                # A plain Engram adaptor has only its historical E path.  The
+                # legacy ``both`` fallback is intentionally a no-op here;
+                # callers asking for a different mode still get an error.
+                continue
+            if setter is None:
+                raise TypeError(
+                    "Reader mode requires a compatible generative reader adaptor"
+                )
+            setter(applied)
+    return applied
+
+
+def reader_mode_result_metadata(wrapper) -> dict:
+    """Return serializable mode metadata attached by ``setup_condition``."""
+    metadata = getattr(wrapper, "reader_mode_contract", None)
+    if metadata is None:
+        return {
+            "requested_reader_mode": None,
+            "effective_reader_mode": None,
+            "reader_mode_provenance": "unspecified",
+        }
+    return dict(metadata)
+
+
+def configure_adaptive_routers(wrapper, adaptor_cfg: dict) -> None:
+    """Restore runtime router controls that are not stored in a state dict."""
+    adaptors = (
+        list(wrapper.adaptor)
+        if isinstance(wrapper.adaptor, torch.nn.ModuleList)
+        else [wrapper.adaptor]
+    )
+    for adaptor in adaptors:
+        if getattr(adaptor, "router", None) is not None:
+            router_kwargs = {
+                "temperature": float(adaptor_cfg.get("router_temperature", 1.0)),
+                "hard": bool(adaptor_cfg.get("router_hard", False)),
+                "min_generated_probability": float(
+                    adaptor_cfg.get("router_min_generated_probability", 0.5)
+                ),
+            }
+            if getattr(adaptor, "fusion_type", None) == "tri_reader":
+                router_kwargs.update(
+                    safe_residual_threshold=float(
+                        adaptor_cfg.get("safe_residual_threshold", 1.0)
+                    ),
+                    safe_residual_scale=float(
+                        adaptor_cfg.get("safe_residual_scale", 1.0)
+                    ),
+                )
+            adaptor.configure_router(**router_kwargs)
+
+
 def setup_condition(args, condition: str, device: torch.device, dtype: torch.dtype):
     if condition == "baseline":
         wrapper = setup_wrapper(
@@ -566,6 +908,14 @@ def setup_condition(args, condition: str, device: torch.device, dtype: torch.dty
             device=device,
             dtype=dtype,
         )
+        # Test doubles and plain baseline wrappers may intentionally expose no
+        # mutable attributes; baseline has no reader mode to configure.
+        if hasattr(wrapper, "__dict__"):
+            wrapper.reader_mode_contract = resolve_reader_mode_contract(
+                getattr(args, "dual_reader_mode", "auto"),
+                {},
+                condition="baseline",
+            )
         return wrapper, None
 
     if args.adaptor_dir is None:
@@ -610,6 +960,10 @@ def setup_condition(args, condition: str, device: torch.device, dtype: torch.dty
     else:
         raise ValueError(f"Unsupported condition: {condition}")
 
+    mode_contract = resolve_reader_mode_contract(
+        getattr(args, "dual_reader_mode", "auto"), adaptor_cfg, condition=condition
+    )
+    advantage_reader = adaptor_cfg.get("advantage_reader")
     wrapper = setup_wrapper(
         args.target_model,
         memory=memory,
@@ -632,15 +986,39 @@ def setup_condition(args, condition: str, device: torch.device, dtype: torch.dty
         generator_heads=int(adaptor_cfg.get("generator_heads", 4)),
         generator_cue_window=int(adaptor_cfg.get("generator_cue_window", 3)),
         generator_fusion_type=adaptor_cfg.get("generator_fusion_type", "generated_only"),
+        generator_adaptive_router=bool(
+            adaptor_cfg.get("generator_adaptive_router", False)
+            or (
+                isinstance(advantage_reader, dict)
+                and advantage_reader.get("enabled", True)
+            )
+        ),
+        generator_router_hidden_size=int(adaptor_cfg.get("generator_router_hidden_size", 16)),
+        generator_router_semantic_size=int(
+            adaptor_cfg.get("generator_router_semantic_size", 0)
+        ),
+        generator_router_expert_mode=adaptor_cfg.get(
+            "generator_router_expert_mode", "residual"
+        ),
+        generator_source_adapter_rank=int(
+            adaptor_cfg.get("generator_source_adapter_rank", 16)
+        ),
+        generator_loop_rounds=int(adaptor_cfg.get("generator_loop_rounds", 1)),
+        generator_loop_workspace_size=int(
+            adaptor_cfg.get("generator_loop_workspace_size", 0)
+        ),
+        generator_loop_gate_max=float(
+            adaptor_cfg.get("generator_loop_gate_max", 0.25)
+        ),
+        advantage_reader=advantage_reader,
     )
-    dual_reader_mode = getattr(args, "dual_reader_mode", "both")
-    if dual_reader_mode != "both":
-        adaptors = list(wrapper.adaptor) if isinstance(wrapper.adaptor, torch.nn.ModuleList) else [wrapper.adaptor]
-        for adaptor in adaptors:
-            setter = getattr(adaptor, "set_dual_reader_mode", None)
-            if setter is None:
-                raise TypeError("--dual-reader-mode requires a generative dual-reader adaptor")
-            setter(dual_reader_mode)
+    configure_adaptive_routers(wrapper, adaptor_cfg)
+    applied_mode = _apply_reader_mode(
+        wrapper, mode_contract["effective_reader_mode"]
+    )
+    mode_contract["effective_reader_mode"] = applied_mode
+    mode_contract["applied_reader_mode"] = applied_mode
+    wrapper.reader_mode_contract = mode_contract
     set_canon_fn = build_canon_fn(wrapper, mem_cfg_dict, args.canon_mode, device)
     return wrapper, set_canon_fn
 
@@ -791,10 +1169,20 @@ def evaluate_openqa(
     max_new_tokens: int,
     max_context_length: int,
     reasoning_mode: str = "vanilla",
+    retain_all_predictions: bool = False,
 ) -> dict:
     correct = 0
     f1_values = []
     sample_predictions = []
+    diagnostic_totals = {
+        "raw_length_chars": 0,
+        "raw_length_tokens": 0,
+        "extracted_length_chars": 0,
+        "extracted_length_tokens": 0,
+        "raw_repetition_count": 0,
+        "extracted_repetition_count": 0,
+        "extraction_changed": 0,
+    }
     official_tokenization = use_official_tokenization(task_name)
 
     for ex in tqdm(examples, desc="Evaluating OpenQA", leave=False):
@@ -810,6 +1198,7 @@ def evaluate_openqa(
             official_tokenization=official_tokenization,
             stop_at_newline=(reasoning_mode == "vanilla"),
         )
+        raw_prediction = prediction
         if reasoning_mode == "cot":
             answer_matches = re.findall(
                 r"<answer>(.*?)</answer>", prediction, flags=re.DOTALL | re.IGNORECASE
@@ -825,16 +1214,31 @@ def evaluate_openqa(
                     prediction,
                     flags=re.IGNORECASE,
                 ).strip()
+        else:
+            prediction = truncate_openqa_prediction(prediction)
+        prediction_info = prediction_diagnostics(raw_prediction, prediction)
+        diagnostic_totals["raw_length_chars"] += prediction_info["raw"]["length_chars"]
+        diagnostic_totals["raw_length_tokens"] += prediction_info["raw"]["length_tokens"]
+        diagnostic_totals["extracted_length_chars"] += prediction_info["extracted"]["length_chars"]
+        diagnostic_totals["extracted_length_tokens"] += prediction_info["extracted"]["length_tokens"]
+        diagnostic_totals["raw_repetition_count"] += prediction_info["raw"]["repetition_count"]
+        diagnostic_totals["extracted_repetition_count"] += prediction_info["extracted"]["repetition_count"]
+        diagnostic_totals["extraction_changed"] += int(
+            prediction_info["extraction_changed"]
+        )
         answers = ex["answers"]
         is_correct = any(exact_match(prediction, answer) for answer in answers)
         best_f1 = max(f1_score(prediction, answer)[0] for answer in answers)
 
         correct += int(is_correct)
         f1_values.append(best_f1)
-        if len(sample_predictions) < 25:
+        if retain_all_predictions or len(sample_predictions) < 25:
             sample_predictions.append({
                 "question": ex["question"],
                 "prediction": prediction,
+                "raw_prediction": raw_prediction,
+                "extracted_prediction": prediction,
+                "prediction_diagnostics": prediction_info,
                 "answers": answers,
                 "correct": is_correct,
                 "f1": best_f1,
@@ -843,6 +1247,7 @@ def evaluate_openqa(
     total = len(examples)
     em = correct / total if total else 0.0
     mean_f1 = float(np.mean(f1_values)) if f1_values else 0.0
+    denominator = max(total, 1)
     return {
         # For OpenQA, accuracy is exact-match accuracy by definition.
         "acc": em,
@@ -851,6 +1256,19 @@ def evaluate_openqa(
         "correct": correct,
         "total": total,
         "sample_predictions": sample_predictions,
+        "prediction_diagnostics": {
+            "n_examples": total,
+            "raw_length_chars_mean": diagnostic_totals["raw_length_chars"] / denominator,
+            "raw_length_tokens_mean": diagnostic_totals["raw_length_tokens"] / denominator,
+            "extracted_length_chars_mean": diagnostic_totals["extracted_length_chars"] / denominator,
+            "extracted_length_tokens_mean": diagnostic_totals["extracted_length_tokens"] / denominator,
+            "raw_repetition_count": diagnostic_totals["raw_repetition_count"],
+            "extracted_repetition_count": diagnostic_totals["extracted_repetition_count"],
+            "raw_repetition_rate": diagnostic_totals["raw_repetition_count"] / denominator,
+            "extracted_repetition_rate": diagnostic_totals["extracted_repetition_count"] / denominator,
+            "extraction_changed": diagnostic_totals["extraction_changed"],
+            "extraction_changed_rate": diagnostic_totals["extraction_changed"] / denominator,
+        },
     }
 
 
@@ -892,6 +1310,7 @@ def evaluate_truthfulqa(
     examples: list[dict],
     device: torch.device,
     max_context_length: int,
+    retain_all_examples: bool = False,
 ) -> dict:
     totals = {"MC1": 0.0, "MC2": 0.0, "MC3": 0.0}
     sample_examples = []
@@ -937,7 +1356,7 @@ def evaluate_truthfulqa(
         )
         for key in totals:
             totals[key] += metrics[key]
-        if len(sample_examples) < 25:
+        if retain_all_examples or len(sample_examples) < 25:
             sample_examples.append({
                 "question": ex["question"],
                 "best_answer": ex["best_answer"],
@@ -969,12 +1388,202 @@ def task_scalar_score(task_name: str, metrics: dict) -> float:
     return metrics[metric_name] * 100.0
 
 
+def _drop_cli_option(argv: list[str], option: str, multiple: bool = False) -> list[str]:
+    """Remove one option from an argv list without interpreting other options.
+
+    ``--tasks`` is the only option with a variable number of values. Keeping
+    this helper deliberately small makes the parallel launcher robust to new
+    evaluator flags: all arguments other than the ones it owns are passed
+    through unchanged to each isolated child process.
+    """
+    result = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == option:
+            index += 1
+            if multiple:
+                while index < len(argv) and not argv[index].startswith("--"):
+                    index += 1
+            elif index < len(argv):
+                index += 1
+            continue
+        if token.startswith(option + "="):
+            index += 1
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def _parallel_child_argv(task: str, output_dir: Path) -> list[str]:
+    """Build argv for one task while preserving every evaluator setting."""
+    child = list(sys.argv[1:])
+    child = _drop_cli_option(child, "--tasks", multiple=True)
+    child = _drop_cli_option(child, "--output-dir")
+    child = _drop_cli_option(child, "--parallel-tasks")
+    child = _drop_cli_option(child, "--task-devices")
+    child.append("--tasks")
+    child.append(task)
+    child.extend(["--output-dir", str(output_dir), "--parallel-tasks", "1"])
+    return child
+
+
+def _parse_task_devices(raw: Optional[str]) -> list[str]:
+    if raw is None:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _aggregate_parallel_results(args, task_dirs: dict[str, Path]) -> dict:
+    """Merge one-task child artifacts into the historical result schema."""
+    child_payloads = {}
+    for task in args.tasks:
+        result_path = task_dirs[task] / "openqa_results.json"
+        if not result_path.exists():
+            raise FileNotFoundError(f"Missing child result for {task}: {result_path}")
+        with result_path.open() as handle:
+            payload = json.load(handle)
+        task_results = payload.get("tasks", {})
+        if set(task_results) != {task}:
+            raise ValueError(
+                f"Child result for {task} contains tasks {sorted(task_results)}"
+            )
+        child_payloads[task] = payload
+
+    all_results = {task: child_payloads[task]["tasks"][task] for task in args.tasks}
+    summary = {}
+    for condition in args.conditions:
+        scores = [
+            task_scalar_score(task, all_results[task][condition])
+            for task in args.tasks
+        ]
+        if scores:
+            summary[condition] = {
+                "average": float(np.mean(scores)),
+                "per_task_scores": scores,
+            }
+    if "baseline" in summary and "transferred" in summary:
+        delta = summary["transferred"]["average"] - summary["baseline"]["average"]
+        baseline_avg = summary["baseline"]["average"]
+        summary["delta"] = {
+            "absolute": delta,
+            "relative_pct": (delta / baseline_avg * 100.0) if baseline_avg != 0 else None,
+        }
+
+    return {
+        "target_model": args.target_model,
+        "seed": args.seed,
+        "canon_mode": args.canon_mode,
+        "triviaqa_config": args.triviaqa_config,
+        "reasoning_mode": args.reasoning_mode,
+        "adaptor_checkpoint": args.adaptor_checkpoint,
+        "dual_reader_mode": args.dual_reader_mode,
+        "reader_mode_resolution": child_payloads[args.tasks[0]].get(
+            "reader_mode_resolution", {}
+        ) if args.tasks else {},
+        "conditions": args.conditions,
+        "tasks": all_results,
+        "summary": summary,
+    }
+
+
+def _run_parallel_tasks(args, output_dir: Path) -> None:
+    """Evaluate tasks in isolated processes and aggregate their artifacts.
+
+    Each process loads exactly one model/adaptor pair and evaluates exactly one
+    task. This avoids sharing mutable hash/adaptor state across tasks and lets
+    callers map workers to separate GPUs. The child command uses
+    ``--parallel-tasks 1``, so this path cannot recursively fan out.
+    """
+    requested_workers = max(1, int(args.parallel_tasks))
+    devices = _parse_task_devices(args.task_devices)
+    if not devices and torch.cuda.is_available():
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible:
+            devices = [part.strip() for part in visible.split(",") if part.strip()]
+        else:
+            devices = [str(index) for index in range(torch.cuda.device_count())]
+    if devices:
+        workers = min(requested_workers, len(devices), len(args.tasks))
+    else:
+        workers = min(requested_workers, len(args.tasks))
+
+    task_dirs = {}
+    for task in args.tasks:
+        task_dir = output_dir / task
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task_dirs[task] = task_dir
+
+    print(
+        f"Parallel evaluation: {len(args.tasks)} tasks, {workers} workers"
+        + (f", devices={devices}" if devices else ", CPU workers")
+    )
+
+    def launch(item):
+        task_index, task = item
+        task_dir = task_dirs[task]
+        stdout_path = task_dir / "stdout.log"
+        stderr_path = task_dir / "stderr.log"
+        command = [sys.executable, str(Path(__file__).resolve())] + _parallel_child_argv(
+            task, task_dir
+        )
+        env = os.environ.copy()
+        if devices:
+            env["CUDA_VISIBLE_DEVICES"] = devices[task_index % len(devices)]
+        with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
+            completed = subprocess.run(command, env=env, stdout=stdout, stderr=stderr)
+        return task, completed.returncode, stdout_path, stderr_path
+
+    failures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(launch, item) for item in enumerate(args.tasks)]
+        for future in concurrent.futures.as_completed(futures):
+            task, returncode, stdout_path, stderr_path = future.result()
+            print(f"  {task}: {'ok' if returncode == 0 else f'failed ({returncode})'}")
+            if returncode != 0:
+                failures.append((task, returncode, stderr_path))
+
+    if failures:
+        details = []
+        for task, returncode, stderr_path in failures:
+            try:
+                tail = stderr_path.read_text(errors="replace")[-2000:]
+            except OSError:
+                tail = "<stderr unavailable>"
+            details.append(f"{task} (exit {returncode})\n{tail}")
+        raise RuntimeError("Parallel evaluation failed:\n" + "\n".join(details))
+
+    final = _aggregate_parallel_results(args, task_dirs)
+    final["parallel"] = {
+        "workers": workers,
+        "devices": devices,
+        "task_dirs": {task: str(path) for task, path in task_dirs.items()},
+    }
+    results_file = output_dir / "openqa_results.json"
+    with results_file.open("w") as handle:
+        json.dump(final, handle, indent=2)
+    print(f"Results saved to {results_file}")
+
+
 def main():
     args = parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results_file = output_dir / "openqa_results.json"
+    if results_file.exists() and not args.overwrite:
+        print(f"Results already exist at {results_file}, skipping.")
+        return
+
+    if args.parallel_tasks > 1 and len(args.tasks) > 1:
+        _run_parallel_tasks(args, output_dir)
+        return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16
@@ -984,14 +1593,6 @@ def main():
             dtype = torch.bfloat16
     else:
         dtype = torch.float32
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    results_file = output_dir / "openqa_results.json"
-    if results_file.exists() and not args.overwrite:
-        print(f"Results already exist at {results_file}, skipping.")
-        return
 
     print(f"Target model: {args.target_model}")
     print(f"Device: {device}, dtype: {dtype}")
@@ -1009,6 +1610,7 @@ def main():
             "set_canon_fn": set_canon_fn,
             "tokenizer": wrapper.tokenizer,
             "max_context_length": get_model_max_context(wrapper, args.max_context_length),
+            "reader_mode": reader_mode_result_metadata(wrapper),
         }
 
     all_results = {}
@@ -1074,6 +1676,8 @@ def main():
                 )
 
             metrics["elapsed_s"] = time.time() - t0
+            mode_metadata = state["reader_mode"]
+            metrics.update(mode_metadata)
             task_results[condition] = metrics
             task_scalars[condition].append(task_scalar_score(task_name, metrics))
 
@@ -1117,6 +1721,10 @@ def main():
         "reasoning_mode": args.reasoning_mode,
         "adaptor_checkpoint": args.adaptor_checkpoint,
         "dual_reader_mode": args.dual_reader_mode,
+        "reader_mode_resolution": {
+            condition: state["reader_mode"]
+            for condition, state in condition_state.items()
+        },
         "conditions": args.conditions,
         "tasks": all_results,
         "summary": summary,

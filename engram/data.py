@@ -116,8 +116,22 @@ class Wikipedia2021Dataset(Dataset):
 
     @staticmethod
     def _tokenizer_matches_source(tokenizer, source_tokenizer_name: str) -> bool:
+        def canonical_name(value: str) -> str:
+            normalized = str(value or "").lower().rstrip("/")
+            # Offline Hugging Face resolution changes ``name_or_path`` from a
+            # repo id into e.g. ``.../models--org--repo/snapshots/<sha>``.
+            # Recover the repo id so strict pre-tokenized-corpus alignment does
+            # not reject the exact same tokenizer merely because it is cached.
+            for part in Path(normalized).parts:
+                if not part.startswith("models--"):
+                    continue
+                pieces = part[len("models--"):].split("--", 1)
+                if len(pieces) == 2 and all(pieces):
+                    return "/".join(pieces)
+            return normalized
+
         name = getattr(tokenizer, "name_or_path", "") or ""
-        return name.lower().rstrip("/") == source_tokenizer_name.lower().rstrip("/")
+        return canonical_name(name) == canonical_name(source_tokenizer_name)
 
     @staticmethod
     def _chunk_token_ids(token_ids: list[int], seq_len: int) -> list[list[int]]:

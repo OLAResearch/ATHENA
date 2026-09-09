@@ -252,6 +252,14 @@ def build_adaptor(
     generator_heads: int = 4,
     generator_cue_window: int = 3,
     generator_fusion_type: str = "generated_only",
+    generator_adaptive_router: bool = False,
+    generator_router_hidden_size: int = 16,
+    generator_router_semantic_size: int = 0,
+    generator_router_expert_mode: str = "residual",
+    generator_source_adapter_rank: int = 16,
+    generator_loop_rounds: int = 1,
+    generator_loop_workspace_size: int = 0,
+    generator_loop_gate_max: float = 0.25,
 ) -> nn.Module:
     """Factory function for adaptor variants.
 
@@ -269,6 +277,32 @@ def build_adaptor(
     if condition == "baseline":
         return None
     if architecture == "generative" and condition not in ("ffn_only", "memory_only"):
+        if generator_fusion_type == "tri_reader":
+            from .tri_memory import TriMemoryAdaptor
+
+            if generator_cue_source != "hybrid":
+                raise ValueError(
+                    "tri_reader fusion requires generator_cue_source='hybrid'"
+                )
+            return TriMemoryAdaptor(
+                d_model=d_model,
+                d_mem=d_mem,
+                reader_type=reader_type,
+                num_latents=generator_num_latents,
+                hidden_size=generator_hidden_size,
+                num_layers=generator_layers,
+                num_heads=generator_heads,
+                cue_window=generator_cue_window,
+                gate_bias_init=gate_bias_init,
+                num_branches=num_branches,
+                adaptive_router=generator_adaptive_router,
+                router_hidden_size=generator_router_hidden_size,
+                router_semantic_size=generator_router_semantic_size,
+                source_adapter_rank=generator_source_adapter_rank,
+                generator_loop_rounds=generator_loop_rounds,
+                generator_loop_workspace_size=generator_loop_workspace_size,
+                generator_loop_gate_max=generator_loop_gate_max,
+            )
         # Local import avoids a module-level cycle because generative_memory
         # reuses RMSNorm from this module.
         from .generative_memory import GenerativeMemoryAdaptor
@@ -286,6 +320,14 @@ def build_adaptor(
             gate_bias_init=gate_bias_init,
             num_branches=num_branches,
             fusion_type=generator_fusion_type,
+            adaptive_router=generator_adaptive_router,
+            router_hidden_size=generator_router_hidden_size,
+            router_semantic_size=generator_router_semantic_size,
+            router_expert_mode=generator_router_expert_mode,
+            source_adapter_rank=generator_source_adapter_rank,
+            generator_loop_rounds=generator_loop_rounds,
+            generator_loop_workspace_size=generator_loop_workspace_size,
+            generator_loop_gate_max=generator_loop_gate_max,
         )
     if condition in ("transferred", "random_memory", "permuted_keys", "train_from_scratch"):
         if num_branches > 1:

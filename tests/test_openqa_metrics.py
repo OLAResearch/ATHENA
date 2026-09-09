@@ -44,6 +44,13 @@ def test_f1_score_handles_partial_overlap():
     assert recall == 1.0
 
 
+def test_f1_does_not_award_full_credit_for_yes_no_substrings():
+    f1, precision, recall = f1_score("not no", "no")
+    assert f1 == 2 / 3
+    assert precision == 0.5
+    assert recall == 1.0
+
+
 def test_truthfulqa_mc_scores():
     scores = compute_truthfulqa_mc_scores(
         scores_true=[-0.1, -0.3],

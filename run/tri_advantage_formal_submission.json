@@ -1,0 +1,11 @@
+{
+  "tag": "tri_advantage_formal_20260908T133625Z",
+  "training_tokens": 20000000,
+  "validation_tokens": 2000000,
+  "seq_len": 2048,
+  "steps": 9765,
+  "reservation_gcd_hours": 60,
+  "runtime_estimate": "Rough 30-50 hours, extrapolated from existing 2048-token multi-path training (~10 s/step), fewer forward-only paths here plus five calibrations, final calibration and four-mode validation. Not a measured throughput for this new reader.",
+  "checkpoint_storage_estimate": "under 2 GB plus logs; source checkpoint reused read-only",
+  "downstream_evaluation": "Separate follow-up after training; not completed by this job"
+}

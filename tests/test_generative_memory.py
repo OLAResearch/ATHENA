@@ -1,8 +1,6 @@
-import inspect
-
 import torch
 
-from engram.adaptor import build_adaptor
+from engram.adaptor import EngramAdaptor, MultiBranchEngramAdaptor, build_adaptor
 from engram.generative_memory import GenerativeMemoryAdaptor
 from scripts.train_adaptor import setup_memory
 
@@ -66,7 +64,10 @@ def test_state_dict_round_trip_and_future_memory_causality():
 def test_build_adaptor_and_generator_boundary():
     adaptor = build_adaptor("transferred", 16, 8, architecture="generative", generator_hidden_size=16, generator_heads=4)
     assert isinstance(adaptor, GenerativeMemoryAdaptor)
-    assert "h" not in inspect.signature(adaptor._generate).parameters
+    h, mem = make_inputs()
+    generated = adaptor._generate(mem, h, h.shape[0], h.shape[1])
+    changed_h = adaptor._generate(mem, h + 100, h.shape[0], h.shape[1])
+    assert torch.equal(generated, changed_h)
     learned = build_adaptor("transferred", 16, 8, architecture="generative", generator_cue_source="learned")
     assert learned.cue_projection is None
     branched = build_adaptor(
@@ -132,6 +133,7 @@ def test_dual_reader_has_independent_engram_and_generated_gates():
     assert gates.shape == (2, 4, *h.shape[:2])
     (contribution.square().mean() + gates.mean()).backward()
     assert adaptor.engram_value_projection.weight.grad is not None
+    assert all(projection.weight.grad is not None for projection in adaptor.engram_key_projection)
     assert adaptor.output_projection.weight.grad is not None
     assert adaptor.engram_gate_bias.grad is not None
 
@@ -160,6 +162,75 @@ def test_dual_reader_runtime_ablation_zeroes_only_selected_gate():
     assert torch.allclose(both, engram_only + generated_only, atol=1e-6, rtol=1e-5)
 
 
+def test_adaptive_router_selects_only_engram_or_engram_plus_residual():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="dual_reader",
+        adaptive_router=True,
+    )
+    outputs = {}
+    for mode in ("engram_only", "both"):
+        adaptor.set_dual_reader_mode(mode)
+        outputs[mode] = adaptor(h, mem)[0]
+
+    adaptor.eval()
+    adaptor.configure_router(hard=True)
+    adaptor.set_dual_reader_mode("routed")
+    for expert_index, mode in enumerate(("engram_only", "both")):
+        with torch.no_grad():
+            adaptor.router[-1].weight.zero_()
+            adaptor.router[-1].bias.fill_(-10.0)
+            adaptor.router[-1].bias[expert_index] = 10.0
+        routed, _ = adaptor(h, mem)
+        assert torch.equal(routed, outputs[mode]), mode
+
+
+def test_router_only_training_freezes_both_memory_experts():
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="dual_reader",
+        adaptive_router=True,
+    )
+    names = adaptor.train_router_only()
+    assert names
+    assert adaptor.dual_reader_mode == "routed"
+    assert all("router" in name for name in names)
+    assert all(
+        parameter.requires_grad == ("router" in name)
+        for name, parameter in adaptor.named_parameters()
+    )
+
+
+def test_dual_reader_zero_generated_delta_matches_engram_only():
+    h, mem = make_inputs()
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        fusion_type="dual_reader",
+    )
+    adaptor.set_dual_reader_mode("both")
+    with torch.no_grad():
+        adaptor.output_projection.weight.zero_()
+    residual_with_zero_delta, _ = adaptor(h, mem)
+
+    adaptor.set_dual_reader_mode("engram_only")
+    engram_only, _ = adaptor(h, mem)
+    assert torch.allclose(
+        residual_with_zero_delta, engram_only, atol=1e-6, rtol=1e-5
+    )
+
+
 def test_dual_reader_can_train_only_generated_branch():
     h, mem = make_inputs()
     adaptor = GenerativeMemoryAdaptor(
@@ -178,6 +249,7 @@ def test_dual_reader_can_train_only_generated_branch():
     assert adaptor.gate_bias.requires_grad
     assert not adaptor.norm_h.weight.requires_grad
     assert not adaptor.engram_value_projection.weight.requires_grad
+    assert all(not p.requires_grad for p in adaptor.engram_key_projection.parameters())
     assert not adaptor.engram_gate_bias.requires_grad
     assert all(not p.requires_grad for p in adaptor.engram_reader_norm.parameters())
 
@@ -187,6 +259,82 @@ def test_dual_reader_can_train_only_generated_branch():
     assert adaptor.gate_bias.grad is not None
     assert adaptor.engram_value_projection.weight.grad is None
     assert adaptor.engram_gate_bias.grad is None
+
+
+def test_dual_reader_import_reproduces_single_branch_legacy_engram():
+    h, mem = make_inputs()
+    legacy = EngramAdaptor(16, 8)
+    converted = GenerativeMemoryAdaptor(
+        16, 8, hidden_size=16, num_heads=4, fusion_type="dual_reader"
+    )
+    converted.initialize_engram_reader_from_legacy(legacy)
+    converted.set_dual_reader_mode("engram_only")
+    expected, expected_gate = legacy(h, mem)
+    actual, actual_gates = converted(h, mem)
+    assert torch.equal(expected, actual)
+    assert torch.equal(expected_gate, actual_gates[1])
+
+
+def test_dual_reader_import_reproduces_four_branch_legacy_engram():
+    h, mem = make_inputs()
+    legacy = MultiBranchEngramAdaptor(16, 8, num_branches=4)
+    converted = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        num_branches=4,
+        fusion_type="dual_reader",
+    )
+    converted.initialize_engram_reader_from_legacy(legacy)
+    converted.set_dual_reader_mode("engram_only")
+    expected, expected_gates = legacy(h, mem)
+    actual, actual_gates = converted(h, mem)
+    assert torch.equal(expected, actual)
+    assert torch.equal(expected_gates, actual_gates[1])
+
+
+def test_dual_reader_single_step_updates_only_generated_branch():
+    torch.manual_seed(11)
+    h, mem = make_inputs(batch=2, seq=4)
+    target = torch.randn_like(h)
+    adaptor = GenerativeMemoryAdaptor(
+        16,
+        8,
+        hidden_size=16,
+        num_heads=4,
+        fusion_type="dual_reader",
+    )
+    adaptor.train_generated_branch_only()
+    adaptor.set_dual_reader_mode("both")
+
+    frozen_before = {
+        name: parameter.detach().clone()
+        for name, parameter in adaptor.named_parameters()
+        if not parameter.requires_grad
+    }
+    generated_before = {
+        name: parameter.detach().clone()
+        for name, parameter in adaptor.named_parameters()
+        if parameter.requires_grad
+    }
+    optimizer = torch.optim.SGD(
+        [parameter for parameter in adaptor.parameters() if parameter.requires_grad],
+        lr=0.1,
+    )
+    contribution, _ = adaptor(h, mem)
+    loss = (contribution - target).square().mean()
+    loss.backward()
+    assert adaptor.output_projection.weight.grad is not None
+    assert adaptor.gate_bias.grad is not None
+    optimizer.step()
+
+    for name, before in frozen_before.items():
+        assert torch.equal(adaptor.state_dict()[name], before), name
+    assert any(
+        not torch.equal(adaptor.state_dict()[name], before)
+        for name, before in generated_before.items()
+    )
 
 
 def test_learned_setup_memory_does_not_open_engram_files():

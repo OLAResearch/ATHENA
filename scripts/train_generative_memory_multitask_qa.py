@@ -1,9 +1,12 @@
-"""Jointly supervise the generated branch on the available training splits.
+"""Train a generated residual corrector on the available training splits.
 
 The frozen Mistral backbone, Engram table, and direct Engram reader are reused
-from the existing dual-reader checkpoint.  Only the generator, generated-memory
-reader, and generated gate are optimized.  After one joint epoch the checkpoint
-is evaluated on all five QA benchmarks using the same task-specific metrics as
+from the existing dual-reader checkpoint.  By default, ``--dual-reader-mode
+both`` keeps the direct Engram output active and optimizes only its generated
+residual correction, i.e. ``engram_output + generated_gate * generated_delta``.
+Pass ``--dual-reader-mode generated_only`` to reproduce the legacy generated-
+only training behavior.  After one joint epoch the checkpoint is evaluated on
+all five QA benchmarks using the same task-specific metrics as
 ``scripts/eval_openqa.py``.
 """
 
@@ -36,7 +39,9 @@ from scripts.eval_openqa import (
     task_scalar_score,
 )
 from scripts.train_adaptor import get_cosine_schedule_with_warmup
-from scripts.train_generative_memory_qa import configure_generated_branch
+from scripts.train_generative_memory_qa import (
+    configure_generated_branch as freeze_generated_branch,
+)
 
 
 TRAIN_TASKS = (
@@ -267,6 +272,38 @@ class AnswerOnlyCollator:
         }
 
 
+def configure_generated_branch(wrapper, dual_reader_mode: str = "both") -> list[str]:
+    """Freeze the baseline and select the generated-reader training mode.
+
+    ``both`` is the residual-corrector mode: the frozen direct Engram output
+    stays in the forward pass and the generated branch learns an additive
+    correction.  ``generated_only`` remains available as an explicit legacy
+    ablation.  The lower-level freezing helper is shared with the single-task
+    trainer so the trainable parameter boundary cannot drift between scripts.
+    """
+    if dual_reader_mode not in {"both", "generated_only"}:
+        raise ValueError(
+            "Generated-branch training requires --dual-reader-mode 'both' "
+            "or 'generated_only'; use eval_openqa.py for the frozen "
+            "'engram_only' baseline."
+        )
+
+    trainable_names = freeze_generated_branch(wrapper)
+    adaptors = (
+        list(wrapper.adaptor)
+        if isinstance(wrapper.adaptor, torch.nn.ModuleList)
+        else [wrapper.adaptor]
+    )
+    for adaptor in adaptors:
+        setter = getattr(adaptor, "set_dual_reader_mode", None)
+        if setter is None:
+            raise TypeError(
+                "--dual-reader-mode requires a generative dual-reader adaptor"
+            )
+        setter(dual_reader_mode)
+    return trainable_names
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-model", default="mistralai/Mistral-7B-v0.3")
@@ -281,9 +318,14 @@ def parse_args():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--dual-reader-mode",
-        choices=["both", "engram_only", "generated_only"],
-        default="generated_only",
-        help="Reader contribution used during generated-branch training and evaluation.",
+        choices=["both", "generated_only"],
+        default="both",
+        help=(
+            "Reader mode for training/evaluation: 'both' (default) is the "
+            "residual corrector engram_output + generated_gate * generated_delta; "
+            "'generated_only' explicitly keeps the legacy behavior. Use "
+            "eval_openqa.py for the frozen 'engram_only' baseline."
+        ),
     )
     parser.add_argument("--canon-mode", default="word_boundary", choices=["vocab", "word_boundary"])
     parser.add_argument("--epochs", type=int, default=1)
@@ -296,6 +338,13 @@ def parse_args():
     parser.add_argument("--max-train-examples-per-task", type=int, default=None)
     parser.add_argument("--max-eval-examples", type=int, default=None)
     parser.add_argument(
+        "--train-tasks",
+        nargs="+",
+        choices=TRAIN_TASKS,
+        default=list(TRAIN_TASKS),
+        help="Training splits to consume in full unless max-train-examples-per-task is set.",
+    )
+    parser.add_argument(
         "--eval-tasks",
         nargs="+",
         choices=EVAL_TASKS,
@@ -307,7 +356,18 @@ def parse_args():
     return parser.parse_args()
 
 
-def evaluate_all_tasks(wrapper, set_canon_fn, device, args):
+def set_dual_reader_mode(wrapper, mode: str) -> None:
+    adaptors = (
+        list(wrapper.adaptor)
+        if isinstance(wrapper.adaptor, torch.nn.ModuleList)
+        else [wrapper.adaptor]
+    )
+    for adaptor in adaptors:
+        adaptor.set_dual_reader_mode(mode)
+
+
+def evaluate_all_tasks(wrapper, set_canon_fn, device, args, reader_mode: str):
+    set_dual_reader_mode(wrapper, reader_mode)
     tokenizer = wrapper.tokenizer
     max_context = get_model_max_context(wrapper, None)
     all_results = {}
@@ -335,6 +395,7 @@ def evaluate_all_tasks(wrapper, set_canon_fn, device, args):
                 device=device,
                 max_new_tokens=args.max_new_tokens,
                 max_context_length=max_context,
+                retain_all_predictions=True,
             )
         metrics["elapsed_s"] = time.time() - started
         all_results[task] = {
@@ -344,8 +405,69 @@ def evaluate_all_tasks(wrapper, set_canon_fn, device, args):
             "metrics": metrics,
             "scalar_score": task_scalar_score(task, metrics),
         }
-        print(f"EVAL {task}: {json.dumps(all_results[task], default=str)}")
+        logged_metrics = {
+            key: value
+            for key, value in metrics.items()
+            if key != "sample_predictions"
+        }
+        print(
+            f"EVAL {task} [{reader_mode}]: "
+            + json.dumps(
+                {
+                    "n_examples": len(examples),
+                    "scalar_metric": TASK_SCALAR_METRICS[task],
+                    "metrics": logged_metrics,
+                },
+                default=str,
+            )
+        )
     return all_results
+
+
+def compare_reader_results(engram_only: dict, both: dict, seed: int) -> dict:
+    """Compute paired NQ deltas and a deterministic bootstrap interval."""
+    baseline = engram_only["nq"]["metrics"]["sample_predictions"]
+    candidate = both["nq"]["metrics"]["sample_predictions"]
+    if len(baseline) != len(candidate):
+        raise ValueError("Paired NQ evaluations have different lengths")
+    for left, right in zip(baseline, candidate):
+        if left["question"] != right["question"]:
+            raise ValueError("Paired NQ evaluations are not in the same order")
+
+    em_delta = np.asarray(
+        [float(right["correct"]) - float(left["correct"]) for left, right in zip(baseline, candidate)]
+    )
+    f1_delta = np.asarray(
+        [float(right["f1"]) - float(left["f1"]) for left, right in zip(baseline, candidate)]
+    )
+    rng = np.random.default_rng(seed)
+    bootstrap_em = []
+    bootstrap_f1 = []
+    for _ in range(2000):
+        sample = rng.integers(0, len(em_delta), size=len(em_delta))
+        bootstrap_em.append(float(em_delta[sample].mean()))
+        bootstrap_f1.append(float(f1_delta[sample].mean()))
+
+    def interval(values):
+        return [float(value) for value in np.quantile(values, [0.025, 0.975])]
+
+    return {
+        "n_examples": len(baseline),
+        "candidate": "both",
+        "baseline": "engram_only",
+        "em_delta": float(em_delta.mean()),
+        "f1_delta": float(f1_delta.mean()),
+        "em_delta_95pct_paired_bootstrap": interval(bootstrap_em),
+        "f1_delta_95pct_paired_bootstrap": interval(bootstrap_f1),
+        "em_improved": int((em_delta > 0).sum()),
+        "em_regressed": int((em_delta < 0).sum()),
+        "em_tied": int((em_delta == 0).sum()),
+        "f1_improved": int((f1_delta > 0).sum()),
+        "f1_regressed": int((f1_delta < 0).sum()),
+        "f1_tied": int((f1_delta == 0).sum()),
+        "bootstrap_samples": 2000,
+        "seed": seed,
+    }
 
 
 def main():
@@ -364,7 +486,7 @@ def main():
     # so its config is the authoritative source for injection and reader
     # construction parameters.  Merge CLI values on top without dropping
     # those fields; downstream evaluators can then load this directory
-    # directly with the same generated-only reader mode.
+    # directly with the same reader mode.
     input_runtime_config = {}
     input_config_path = Path(args.adaptor_dir) / "config.json"
     if input_config_path.exists():
@@ -387,14 +509,17 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    trainable_names = configure_generated_branch(wrapper)
+    trainable_names = configure_generated_branch(wrapper, args.dual_reader_mode)
     trainable = wrapper.get_trainable_params()
     print(f"Trainable generated-branch parameters: {sum(p.numel() for p in trainable):,}")
     print("Trainable tensors:\n  " + "\n  ".join(trainable_names))
     assert trainable and all(not p.requires_grad for p in wrapper.backbone.parameters())
     assert wrapper.memory is None or all(not p.requires_grad for p in wrapper.memory.parameters())
 
-    train_dataset = JointQADataset(max_examples_per_task=args.max_train_examples_per_task)
+    train_dataset = JointQADataset(
+        tasks=args.train_tasks,
+        max_examples_per_task=args.max_train_examples_per_task,
+    )
     print(f"Training sources: {json.dumps(train_dataset.sources)}")
     print(f"Joint train size: {len(train_dataset):,}")
     collator = AnswerOnlyCollator(tokenizer, args.max_length)
@@ -460,13 +585,34 @@ def main():
     torch.save(wrapper.adaptor.state_dict(), output_dir / "adaptor.pt")
     torch.save(wrapper.adaptor.state_dict(), output_dir / "adaptor_best.pt")
     wrapper.eval()
-    evaluation = evaluate_all_tasks(wrapper, set_canon_fn, device, args)
+    if args.dual_reader_mode == "both":
+        evaluation = {
+            "engram_only": evaluate_all_tasks(
+                wrapper, set_canon_fn, device, args, "engram_only"
+            ),
+            "both": evaluate_all_tasks(wrapper, set_canon_fn, device, args, "both"),
+        }
+        comparison = compare_reader_results(
+            evaluation["engram_only"], evaluation["both"], args.seed
+        )
+    else:
+        evaluation = {
+            args.dual_reader_mode: evaluate_all_tasks(
+                wrapper, set_canon_fn, device, args, args.dual_reader_mode
+            )
+        }
+        comparison = None
     results = {
         "objective": "joint_answer_and_code_only_cross_entropy",
-        "train_tasks": list(TRAIN_TASKS),
+        "train_tasks": list(args.train_tasks),
         "eval_tasks": list(args.eval_tasks),
         "frozen": ["backbone", "engram_table", "engram_reader"],
         "trainable": ["generator", "generated_reader", "generated_gate"],
+        "fusion": (
+            "engram_output + generated_gate * generated_delta"
+            if args.dual_reader_mode == "both"
+            else args.dual_reader_mode
+        ),
         "dual_reader_mode": args.dual_reader_mode,
         "training_sources": train_dataset.sources,
         "training_exclusions": TRAINING_EXCLUSIONS,
@@ -475,6 +621,7 @@ def main():
         "final_batch_loss": final_loss,
         "optimizer_steps": global_step,
         "evaluation": evaluation,
+        "paired_comparison": comparison,
         "elapsed_hours": (time.time() - started) / 3600,
         "completed": True,
     }

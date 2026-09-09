@@ -48,6 +48,17 @@ def test_tokenizer_match_is_based_on_repo_id():
     )
 
 
+def test_tokenizer_match_recognizes_huggingface_snapshot_cache_path():
+    tokenizer = _NamedTokenizer(
+        "/scratch/cache/huggingface/hub/"
+        "models--mistralai--Mistral-7B-v0.3/snapshots/deadbeef"
+    )
+    assert Wikipedia2021Dataset._tokenizer_matches_source(
+        tokenizer,
+        "mistralai/Mistral-7B-v0.3",
+    )
+
+
 def test_chunk_token_ids_drops_incomplete_tail():
     chunks = Wikipedia2021Dataset._chunk_token_ids([1, 2, 3, 4, 5], seq_len=2)
     assert chunks == [[1, 2], [3, 4]]

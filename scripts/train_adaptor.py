@@ -155,7 +155,10 @@ def parse_args():
     parser.add_argument("--canon-mode", type=str, default="vocab",
                         choices=["vocab", "word_boundary"])
     parser.add_argument("--corpus", type=str, default="wikitext",
-                        choices=["wikitext", "wikipedia-2021", "fineweb-edu", "nemotron-cc"],
+                        choices=[
+                            "wikitext", "wikipedia-2021", "fineweb-edu", "general-mixed",
+                            "nemotron-cc-code", "nemotron-cc",
+                        ],
                         help="Training/eval corpus for adaptor fitting (default: wikitext)")
     parser.add_argument("--corpus-subset", type=str, default="hq-dqa",
                         help="Subset for nemotron-cc: hq-dqa, hq, mhq, all (default: hq-dqa)")
@@ -203,6 +206,15 @@ def parse_args():
             "Train E, GE, GH and the unified seven-way subset Reader jointly "
             "from token zero. The Reader chooses E, GE, GH, any pair, or all "
             "three independently for each token."
+        ),
+    )
+    parser.add_argument(
+        "--joint-tri-experts-only",
+        action="store_true",
+        help=(
+            "Train only the E, GE, and GH experts with independent causal-LM "
+            "losses. Router tensors are materialized for checkpoint compatibility "
+            "but remain frozen and are not part of the training objective."
         ),
     )
     parser.add_argument(
@@ -288,6 +300,18 @@ def load_config(args):
         for key, val in adaptor_cfg.items():
             key_underscore = key.replace("-", "_")
             if hasattr(args, key_underscore):
+                # YAML 1.1 (used by some cluster images) treats scientific
+                # notation without a decimal point, such as ``3e-05``, as a
+                # string.  Restore the argparse-declared scalar type so an
+                # optimizer never receives a textual learning rate.
+                current = getattr(args, key_underscore)
+                if val is not None and current is not None:
+                    if isinstance(current, bool):
+                        val = bool(val)
+                    elif isinstance(current, int) and not isinstance(current, bool):
+                        val = int(val)
+                    elif isinstance(current, float):
+                        val = float(val)
                 setattr(args, key_underscore, val)
     return args
 
@@ -306,6 +330,12 @@ def tri_reader_mode_contract(args) -> dict:
     elif getattr(args, "joint_tri_subset_reader", False):
         training_mode = "tri_subset_soft_fused"
         hard_ablation = "tri_subset_routed"
+    elif getattr(args, "joint_tri_experts_only", False):
+        # Expert-only training has no learned deployment mode.  Validation
+        # checkpoint selection uses the geometric mean of the three forced
+        # endpoint PPLs, while the saved adaptor remains endpoint-addressable.
+        training_mode = None
+        hard_ablation = None
     elif getattr(args, "joint_tri_reader", False):
         # The historical endpoint-supervised tri design intentionally trains
         # its hard source Reader path.  Preserve that mode as its contract.
@@ -318,10 +348,17 @@ def tri_reader_mode_contract(args) -> dict:
     deployment_mode = getattr(args, "deployment_reader_mode", None)
     if deployment_mode is None:
         deployment_mode = training_mode
+    checkpoint_selection_mode = (
+        "tri_experts_mean"
+        if getattr(args, "joint_tri_experts_only", False)
+        else training_mode
+    )
     return {
         "training_reader_mode": training_mode,
-        "deployment_reader_mode": deployment_mode,
-        "checkpoint_selection_reader_mode": training_mode,
+        "deployment_reader_mode": (
+            None if getattr(args, "joint_tri_experts_only", False) else deployment_mode
+        ),
+        "checkpoint_selection_reader_mode": checkpoint_selection_mode,
         "hard_ablation_reader_mode": hard_ablation,
     }
 
@@ -423,19 +460,37 @@ def load_initial_adaptor(
     if wrapper.adaptor is None:
         raise ValueError("--init-adaptor was provided but this condition does not build an adaptor")
     configure_advantage_reader(wrapper, advantage_reader)
-    init_state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if isinstance(wrapper.adaptor, torch.nn.ModuleList):
-        has_layer_prefix = any(key.split(".", 1)[0].isdigit() for key in init_state)
-        if has_layer_prefix:
-            wrapper.adaptor.load_state_dict(init_state, strict=True)
-            init_params = sum(value.numel() for value in init_state.values())
+    # Loading a large CPU state dict directly into a ROCm-resident module can
+    # trigger a low-level SIGSEGV in torch 2.9 (seen with the 641 MB FFN
+    # checkpoint on LUMI).  Materialize and validate the warm-start entirely
+    # on CPU, then perform one module-level device transfer.
+    adaptors = wrapper.adaptor
+    original_device = next(adaptors.parameters()).device
+    moved_to_cpu = original_device.type != "cpu"
+    if moved_to_cpu:
+        adaptors.to("cpu")
+    try:
+        init_state = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+        if isinstance(adaptors, torch.nn.ModuleList):
+            has_layer_prefix = any(key.split(".", 1)[0].isdigit() for key in init_state)
+            if has_layer_prefix:
+                adaptors.load_state_dict(init_state, strict=True)
+                init_params = sum(value.numel() for value in init_state.values())
+            else:
+                for adaptor in adaptors:
+                    adaptor.load_state_dict(init_state, strict=True)
+                init_params = sum(value.numel() for value in init_state.values()) * len(adaptors)
         else:
-            for adaptor in wrapper.adaptor:
-                adaptor.load_state_dict(init_state, strict=True)
-            init_params = sum(value.numel() for value in init_state.values()) * len(wrapper.adaptor)
-    else:
-        wrapper.adaptor.load_state_dict(init_state, strict=True)
-        init_params = sum(value.numel() for value in init_state.values())
+            adaptors.load_state_dict(init_state, strict=True)
+            init_params = sum(value.numel() for value in init_state.values())
+    finally:
+        if moved_to_cpu:
+            adaptors.to(original_device)
     return init_params
 
 
@@ -546,7 +601,10 @@ def configure_joint_tri_reader_training(
             else "tri_routed"
         )
 
-    named = list(wrapper.adaptor.named_parameters())
+    for adaptor in adaptors:
+        if hasattr(adaptor, "freeze_unused_ablation_parameters"):
+            adaptor.freeze_unused_ablation_parameters()
+    named = [(n, p) for n, p in wrapper.adaptor.named_parameters() if p.requires_grad]
     router_params = [
         parameter
         for name, parameter in named
@@ -562,6 +620,41 @@ def configure_joint_tri_reader_training(
     if not router_params or not expert_params:
         raise RuntimeError("Tri-reader optimizer groups must contain experts and router")
     return names, expert_params, router_params
+
+
+def configure_joint_tri_experts_training(
+    wrapper: BackboneWrapper,
+) -> tuple[list[str], list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    """Train E/GE/GH endpoints without training a Reader/router.
+
+    The adaptive router modules are still materialized so that the resulting
+    checkpoint has the same parameter topology expected by the later
+    E-anchored advantage-router stage. They are explicitly frozen here and
+    never receive a routing or distillation loss.
+    """
+    adaptors = _wrapper_adaptors(wrapper)
+    if not adaptors or not all(isinstance(adaptor, TriMemoryAdaptor) for adaptor in adaptors):
+        raise TypeError("Expert-only three-way training requires TriMemoryAdaptor instances")
+    for adaptor in adaptors:
+        if adaptor.router is None or adaptor.subset_router is None:
+            raise ValueError(
+                "Expert-only training requires materialized router tensors for checkpoint compatibility"
+            )
+        for parameter in adaptor.parameters():
+            parameter.requires_grad = True
+        for module in (adaptor.router, adaptor.subset_router):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+        adaptor.set_tri_reader_mode("engram_only")
+        if hasattr(adaptor, "freeze_unused_ablation_parameters"):
+            adaptor.freeze_unused_ablation_parameters()
+
+    named = [(name, parameter) for name, parameter in wrapper.adaptor.named_parameters() if parameter.requires_grad]
+    expert_params = [parameter for _, parameter in named]
+    names = [name for name, _ in named]
+    if not expert_params:
+        raise RuntimeError("Expert-only tri training produced no trainable expert parameters")
+    return names, expert_params, []
 
 
 def configure_joint_engram_generated_router_training(
@@ -998,6 +1091,7 @@ def main():
     if (
         args.joint_tri_reader
         or args.joint_tri_subset_reader
+        or args.joint_tri_experts_only
         or args.joint_tri_route_only
     ):
         if (
@@ -1020,8 +1114,11 @@ def main():
                 args.engram_source_loss_weight,
                 args.ge_source_loss_weight,
                 args.gh_source_loss_weight,
-                args.routed_source_loss_weight,
             )
+            if args.joint_tri_experts_only:
+                pass
+            else:
+                weights = weights + (args.routed_source_loss_weight,)
             if args.joint_tri_subset_reader:
                 weights = weights + (args.subset_routed_source_loss_weight,)
             if any(weight <= 0 for weight in weights):
@@ -1035,6 +1132,9 @@ def main():
                 "Tri-memory source competition does not use a residual penalty; "
                 "set --generated-residual-penalty 0"
             )
+        # Keep router tensors in the expert checkpoint so the subsequent
+        # advantage-router stage can restore the exact adaptor structure. In
+        # expert-only mode those tensors are frozen and never enter the loss.
         args.generator_adaptive_router = True
 
     reader_contract = tri_reader_mode_contract(args)
@@ -1113,6 +1213,12 @@ def main():
         init_params = load_initial_adaptor(wrapper, args.init_adaptor)
         print(f"Warm-started adaptor from {args.init_adaptor} ({init_params:,} params)")
 
+    # FFN-only adaptors are intentionally constructed on CPU so that a large
+    # warm-start checkpoint never crosses from GPU back to CPU.  Move it to
+    # the training device only after loading/validation is complete.
+    if args.condition == "ffn_only" and wrapper.adaptor is not None:
+        wrapper.adaptor = wrapper.adaptor.to(device)
+
     if args.deterministic_engram_init_seed is not None:
         initialized = initialize_direct_engram_readers(
             wrapper, args.deterministic_engram_init_seed
@@ -1130,6 +1236,14 @@ def main():
         )
         print(
             "Jointly trainable E/GE/GH route-only MoE tensors:\n  "
+            + "\n  ".join(trainable_names)
+        )
+    elif args.joint_tri_experts_only:
+        trainable_names, joint_reader_params, joint_router_params = (
+            configure_joint_tri_experts_training(wrapper)
+        )
+        print(
+            "Jointly trainable E/GE/GH expert tensors (routers frozen):\n  "
             + "\n  ".join(trainable_names)
         )
     elif args.joint_tri_reader:
@@ -1183,6 +1297,8 @@ def main():
     # For train_from_scratch, memory is trainable
     if args.condition == "train_from_scratch":
         wrapper.unfreeze_memory()
+        if joint_reader_params is not None:
+            joint_reader_params.extend(wrapper.memory.parameters())
     elif memory is not None:
         wrapper.freeze_memory()
 
@@ -1251,7 +1367,14 @@ def main():
     )
 
     def evaluate_validation_ppl(mode: str | None = None) -> float:
-        if mode is not None:
+        endpoint_modes = None
+        if mode == "tri_experts_mean":
+            endpoint_modes = (
+                "engram_only",
+                "generated_from_engram_only",
+                "generated_from_context_only",
+            )
+        elif mode is not None:
             _set_joint_reader_mode(wrapper, mode)
         wrapper.eval()
         val_losses = []
@@ -1260,12 +1383,16 @@ def main():
                 val_ids = val_batch["input_ids"].to(device)
                 val_labels = val_batch["labels"].to(device)
                 set_memory_context(wrapper, val_ids)
-                val_out = wrapper(
-                    input_ids=val_ids,
-                    labels=val_labels,
-                    use_cache=False,
-                )
-                val_losses.append(float(val_out.loss.item()))
+                modes = endpoint_modes or (None,)
+                for endpoint_mode in modes:
+                    if endpoint_mode is not None:
+                        _set_joint_reader_mode(wrapper, endpoint_mode)
+                    val_out = wrapper(
+                        input_ids=val_ids,
+                        labels=val_labels,
+                        use_cache=False,
+                    )
+                    val_losses.append(float(val_out.loss.item()))
         if not val_losses:
             raise RuntimeError("Validation loader produced no batches")
         return math.exp(sum(val_losses) / len(val_losses))
@@ -1329,15 +1456,13 @@ def main():
         or args.joint_source_reader
         or args.joint_tri_reader
         or args.joint_tri_subset_reader
+        or args.joint_tri_experts_only
         or args.joint_tri_route_only
     ):
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": joint_reader_params, "lr": args.lr},
-                {"params": joint_router_params, "lr": args.router_lr},
-            ],
-            weight_decay=0.01,
-        )
+        param_groups = [{"params": joint_reader_params, "lr": args.lr}]
+        if joint_router_params:
+            param_groups.append({"params": joint_router_params, "lr": args.router_lr})
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
     else:
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, total_steps)
@@ -1412,14 +1537,22 @@ def main():
                 running_router_distillation += (
                     float(load_balance.item()) / accum_steps
                 )
-            elif args.joint_tri_reader or args.joint_tri_subset_reader:
-                # All three experts and the Reader are active from token zero.
-                # Forced-path losses prevent a weak source from being starved
-                # by the learned Reader during early training.  The unified
-                # variant additionally trains all seven subset endpoints and
-                # then distills the best per-token endpoint into its subset
-                # head.
-                if args.joint_tri_subset_reader:
+            elif (
+                args.joint_tri_reader
+                or args.joint_tri_subset_reader
+                or args.joint_tri_experts_only
+            ):
+                # All three experts are active from token zero.  Expert-only
+                # training uses just the three forced endpoint losses; the
+                # joint Reader variants additionally expose pair/triple paths
+                # and their corresponding distillation objective.
+                if args.joint_tri_experts_only:
+                    source_weights = {
+                        "engram_only": args.engram_source_loss_weight,
+                        "generated_from_engram_only": args.ge_source_loss_weight,
+                        "generated_from_context_only": args.gh_source_loss_weight,
+                    }
+                elif args.joint_tri_subset_reader:
                     source_weights = {
                         "engram_only": args.engram_source_loss_weight,
                         "generated_from_engram_only": args.ge_source_loss_weight,
@@ -1503,7 +1636,9 @@ def main():
                     lm_value += float(weighted_lm.item())
                     distillation_value += float(distillation_objective.item())
                 reader_mode = (
-                    "tri_subset_joint"
+                    "tri_experts_joint"
+                    if args.joint_tri_experts_only
+                    else "tri_subset_joint"
                     if args.joint_tri_subset_reader
                     else "tri_source_joint"
                 )
@@ -1781,6 +1916,8 @@ def main():
                     # Save best adaptor checkpoint
                     if wrapper.adaptor is not None:
                         torch.save(wrapper.adaptor.state_dict(), output_dir / "adaptor_best.pt")
+                    if args.condition == "train_from_scratch":
+                        torch.save(wrapper.memory.state_dict(), output_dir / "memory_best.pt")
                     print(f"  >> Val PPL: {val_ppl:.2f} (new best)")
                 else:
                     patience_counter += 1
@@ -1811,6 +1948,8 @@ def main():
     best_ckpt = output_dir / "adaptor_best.pt"
     if best_ckpt.exists() and wrapper.adaptor is not None:
         wrapper.adaptor.load_state_dict(torch.load(best_ckpt, map_location=device, weights_only=True))
+        if args.condition == "train_from_scratch":
+            wrapper.memory.load_state_dict(torch.load(output_dir / "memory_best.pt", map_location=device, weights_only=True))
         print(f"Restored best adaptor from step {best_step}")
     if args.deployment_reader_mode is not None:
         _set_joint_reader_mode(wrapper, args.deployment_reader_mode)
@@ -1820,7 +1959,14 @@ def main():
         gate_stats = gate_analyzer.compute_stats()
         elapsed = time.time() - start_time
         validation = {}
-        if args.joint_tri_subset_reader:
+        if args.joint_tri_experts_only:
+            validation_modes = (
+                "engram_only",
+                "generated_from_engram_only",
+                "generated_from_context_only",
+                "tri_experts_mean",
+            )
+        elif args.joint_tri_subset_reader:
             validation_modes = (
                 "engram_only",
                 "generated_from_engram_only",
@@ -1860,6 +2006,7 @@ def main():
                     or args.joint_source_reader
                     or args.joint_tri_reader
                     or args.joint_tri_subset_reader
+                    or args.joint_tri_experts_only
                     or args.joint_tri_route_only
                 )
                 else None
@@ -1891,6 +2038,9 @@ def main():
                 "token_zero_joint_E_GE_GH_route_only_moe"
                 if args.joint_tri_route_only
                 else (
+                    "token_zero_joint_E_GE_GH_experts_only"
+                    if args.joint_tri_experts_only
+                    else (
                     "token_zero_joint_E_GE_GH_tri_reader"
                     if args.joint_tri_reader
                     else (
@@ -1906,9 +2056,10 @@ def main():
                     )
                     )
                     )
+                    )
                 )
             ),
-            "training_data": "wikipedia-2021-causal-next-token-only",
+            "training_data": f"{args.corpus}-causal-next-token-only",
             "max_tokens": args.max_tokens,
             "validation": validation,
             "trainable_params": total_trainable,
@@ -1919,7 +2070,11 @@ def main():
 
         if wrapper.adaptor is not None:
             torch.save(wrapper.adaptor.state_dict(), output_dir / "adaptor.pt")
-        if args.condition == "train_from_scratch" and wrapper.memory is not None:
+        # Preserve the exact memory used by each content-control run.  Random
+        # and permuted-key controls must be evaluated against the same tensor
+        # instance as training; reconstructing them at evaluation time can
+        # otherwise change RNG state or permutation order.
+        if args.condition in ("random_memory", "permuted_keys", "train_from_scratch") and wrapper.memory is not None:
             torch.save(wrapper.memory.state_dict(), output_dir / "memory.pt")
 
         print("\nSkipped final test evaluation; saved adaptor checkpoint for downstream eval.")

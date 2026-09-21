@@ -3,6 +3,7 @@ import pytest
 
 from engram.tri_memory import TRI_READER_SUBSETS, TriMemoryAdaptor
 from scripts.train_adaptor import (
+    configure_joint_tri_experts_training,
     configure_joint_tri_reader_training,
     tri_reader_diagnostics,
     tri_joint_loss_terms,
@@ -13,6 +14,20 @@ from scripts.train_adaptor import (
 class _Wrapper:
     def __init__(self, adaptor):
         self.adaptor = adaptor
+
+
+def test_expert_only_configuration_freezes_both_router_heads():
+    torch.manual_seed(99)
+    adaptor = TriMemoryAdaptor(16, 8, hidden_size=16, num_heads=4)
+    wrapper = _Wrapper(adaptor)
+    names, expert_params, router_params = configure_joint_tri_experts_training(wrapper)
+
+    assert names
+    assert router_params == []
+    assert adaptor.tri_reader_mode == "engram_only"
+    assert all(parameter.requires_grad for parameter in expert_params)
+    assert all(not parameter.requires_grad for parameter in adaptor.router.parameters())
+    assert all(not parameter.requires_grad for parameter in adaptor.subset_router.parameters())
 
 
 def test_tri_joint_distillation_weight_is_not_path_normalized_twice():

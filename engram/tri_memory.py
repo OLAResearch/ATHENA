@@ -15,6 +15,9 @@ three sources, while ``tri_subset_routed`` and ``tri_subset_soft_fused`` add a
 unified seven-way subset Reader that can choose the subset itself per token.
 ``tri_safe_routed`` keeps the direct Engram contribution as a residual base
 and only adds generated-source corrections selected by the three-way router.
+``tri_random_advantage_routed`` keeps the trained E-anchored route weights but
+permutes them across token positions, providing an inference-only
+random-router control with matched route mass.
 GE and GH share the expensive generator and reader parameters; cue
 projections, source embeddings, and small low-rank output adapters preserve
 source identity.
@@ -50,6 +53,7 @@ TRI_READER_MODES = frozenset(
         "tri_subset_routed",
         "tri_subset_soft_fused",
         "tri_advantage_routed",
+        "tri_random_advantage_routed",
     }
 )
 
@@ -79,6 +83,8 @@ TRI_READER_MODE_ALIASES = {
     "tri_auto_soft": "tri_subset_soft_fused",
     "tri_advantage": "tri_advantage_routed",
     "advantage_routed": "tri_advantage_routed",
+    "random_router": "tri_random_advantage_routed",
+    "tri_random_router": "tri_random_advantage_routed",
 }
 
 TRI_MODE_EXPERTS = {
@@ -98,6 +104,7 @@ TRI_MODE_EXPERTS = {
     # The E-anchored advantage reader always evaluates all three standalone
     # experts before selecting a source or subset candidate.
     "tri_advantage_routed": (0, 1, 2),
+    "tri_random_advantage_routed": (0, 1, 2),
 }
 
 # Candidate subsets for the unified Reader.  The order is part of the
@@ -225,6 +232,8 @@ class TriMemoryAdaptor(nn.Module):
         self._last_advantage_predictions: torch.Tensor | None = None
         self._last_advantage_confidence_logits: torch.Tensor | None = None
         self._last_advantage_weights: torch.Tensor | None = None
+        self._random_router_seed = 0
+        self._random_router_calls = 0
 
         # Direct Engram reader (E). Names intentionally mirror the legacy
         # dual reader so deterministic initialization can be copied exactly.
@@ -867,6 +876,17 @@ class TriMemoryAdaptor(nn.Module):
             "semantic_context_size": self.d_model,
         }
 
+    def configure_random_router(self, seed: int = 42) -> None:
+        """Configure deterministic token-wise permutation for random routing.
+
+        The trained advantage head is still evaluated. Only its realised
+        source-weight vectors are permuted across token positions, preserving
+        the empirical route/alpha distribution while removing its input
+        alignment. This is intentionally an inference-only control.
+        """
+        self._random_router_seed = int(seed)
+        self._random_router_calls = 0
+
     def train_advantage_reader_only(self) -> list[str]:
         """Freeze every existing parameter and expose only the new head."""
         if self.advantage_router is None:
@@ -1216,6 +1236,60 @@ class TriMemoryAdaptor(nn.Module):
             return e_output, visible_gates
         return contribution, visible_gates
 
+    def _random_advantage_route(
+        self,
+        h: torch.Tensor,
+        mem: torch.Tensor,
+        cue_mem: torch.Tensor | None,
+        context_h: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply trained route weights after token-wise randomisation.
+
+        The current ATHENA checkpoint uses the three standalone candidates
+        E/GE/GH. We first run the normal E-anchored route, then permute its
+        realised three-source weights over batch/time positions and apply
+        those weights to the same source endpoints. This preserves the
+        empirical source and interpolation-strength distribution while
+        removing its input-conditioned alignment.
+        """
+        contribution, visible_gates = self._advantage_route(
+            h, mem, cue_mem, context_h
+        )
+        if self._advantage_candidate_subsets != ((0,), (1,), (2,)):
+            raise ValueError(
+                "Random-router control requires standalone E/GE/GH candidates"
+            )
+        if self._last_source_outputs is None or self._last_router_weights is None:
+            raise RuntimeError("Advantage route did not expose source diagnostics")
+
+        del contribution
+        weights = self._last_router_weights
+        if weights.shape[-1] != 3:
+            raise RuntimeError(
+                f"Expected three-source route weights, got {tuple(weights.shape)}"
+            )
+        flat_weights = weights.reshape(-1, 3)
+        generator = torch.Generator(device=flat_weights.device)
+        generator.manual_seed(self._random_router_seed + self._random_router_calls)
+        self._random_router_calls += 1
+        permutation = torch.randperm(
+            flat_weights.shape[0],
+            generator=generator,
+            device=flat_weights.device,
+        )
+        shuffled = flat_weights[permutation].reshape_as(weights)
+        self._last_router_weights = shuffled
+        self._last_advantage_weights = shuffled
+
+        source_outputs = self._last_source_outputs
+        randomised = torch.zeros_like(source_outputs[0])
+        for source_index in range(3):
+            randomised = randomised + (
+                shuffled[..., source_index : source_index + 1]
+                * source_outputs[source_index]
+            )
+        return randomised, visible_gates
+
     def _subset_route(
         self,
         h: torch.Tensor,
@@ -1340,6 +1414,14 @@ class TriMemoryAdaptor(nn.Module):
                 context_h,
             )
             return contribution, gate_values
+        if mode == "tri_random_advantage_routed":
+            contribution, gate_values = self._random_advantage_route(
+                h,
+                mem,
+                cue_mem,
+                context_h,
+            )
+            return contribution, gate_values
 
         direct_output = None
         direct_gate = None
@@ -1441,9 +1523,9 @@ class TriMemoryAdaptor(nn.Module):
 
     def set_tri_reader_mode(self, mode: str) -> None:
         mode = normalize_tri_reader_mode(mode)
-        if mode == "tri_advantage_routed" and self.advantage_router is None:
+        if mode in {"tri_advantage_routed", "tri_random_advantage_routed"} and self.advantage_router is None:
             raise ValueError(
-                "tri_advantage_routed requires configure_advantage_reader()"
+                "Advantage routing modes require configure_advantage_reader()"
             )
         if mode in {"tri_routed", "tri_soft_fused", "tri_safe_routed"} and self.router is None:
             raise ValueError("tri routed modes require adaptive_router=True")

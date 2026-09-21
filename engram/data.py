@@ -5,6 +5,8 @@ Supports:
   - Wikipedia-2021 (pre-tokenized Dec 2021 dump, configurable tokenizer)
   - FineWeb-Edu (educational web text)
   - Nemotron-CC (high-quality web subsets)
+  - General-mixed (WikiText-103 + Amazon Reviews + CC-News + IMDB)
+  - Nemotron-CC-Code-v1 (Common Crawl code pages)
 
 Provides fixed-length token sequences with configurable token budgets.
 """
@@ -85,6 +87,101 @@ class WikiTextDataset(Dataset):
             "input_ids": input_ids,
             "labels": input_ids.clone(),
         }
+
+
+GENERAL_MIXTURE = (
+    ("wikitext", "Salesforce/wikitext", "wikitext-103-raw-v1"),
+    ("amazon_reviews", "amazon_polarity", None),
+    ("cc_news", "cc_news", None),
+    ("imdb", "imdb", None),
+)
+
+
+def _example_text(example: dict, source: str) -> str:
+    """Extract text from the heterogeneous general-corpus schemas."""
+    if source == "wikitext":
+        return str(example.get("text", ""))
+    if source == "amazon_reviews":
+        title = str(example.get("title", "") or "")
+        content = str(example.get("content", "") or "")
+        return f"{title}\n{content}".strip()
+    if source == "cc_news":
+        parts = [str(example.get(key, "") or "") for key in ("title", "description", "text")]
+        return "\n".join(part for part in parts if part).strip()
+    return str(example.get("text", "") or "")
+
+
+class GeneralMixedDataset(Dataset):
+    """Equal-token streaming mixture of four general NLP corpora.
+
+    The mixture is deliberately token-balanced rather than example-balanced,
+    because the four datasets have very different document lengths. WikiText
+    uses its official train/validation split; Amazon Polarity and IMDB use
+    train/test, while CC-News uses a different deterministic stream seed for
+    validation because it exposes only a train split.
+    """
+
+    def __init__(
+        self,
+        split: str,
+        tokenizer,
+        seq_len: int = 512,
+        max_tokens: int = 200_000_000,
+        seed: int = 42,
+    ):
+        self.seq_len = seq_len
+        if split not in {"train", "validation", "test"}:
+            raise ValueError(f"Unsupported general-mixed split: {split}")
+
+        from datasets import load_dataset
+
+        total_budget = int(max_tokens)
+        source_budgets = [total_budget // len(GENERAL_MIXTURE)] * len(GENERAL_MIXTURE)
+        source_budgets[-1] += total_budget - sum(source_budgets)
+        all_ids: list[int] = []
+        source_counts: dict[str, int] = {}
+        for source_index, ((source, repo, config), budget) in enumerate(
+            zip(GENERAL_MIXTURE, source_budgets)
+        ):
+            if source == "wikitext":
+                source_split = "validation" if split in {"validation", "test"} else "train"
+            elif source in {"amazon_reviews", "imdb"}:
+                source_split = "test" if split in {"validation", "test"} else "train"
+            else:
+                source_split = "train"
+
+            kwargs = {"split": source_split, "streaming": True}
+            if config is not None:
+                kwargs["name"] = config
+            ds = load_dataset(repo, **kwargs)
+            if hasattr(ds, "shuffle"):
+                ds = ds.shuffle(seed=seed + source_index + (10000 if split != "train" else 0), buffer_size=10_000)
+
+            source_ids: list[int] = []
+            for example in ds:
+                text = _example_text(example, source)
+                if text.strip():
+                    source_ids.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
+                if len(source_ids) >= budget:
+                    source_ids = source_ids[:budget]
+                    break
+            all_ids.extend(source_ids)
+            source_counts[source] = len(source_ids)
+
+        print(
+            f"  General-mixed [{split}] loaded: {len(all_ids):,} tokens "
+            f"from {source_counts}"
+        )
+        n_seqs = len(all_ids) // seq_len
+        self.tokens = torch.tensor(all_ids[: n_seqs * seq_len], dtype=torch.long)
+        self.tokens = self.tokens.view(n_seqs, seq_len)
+
+    def __len__(self) -> int:
+        return self.tokens.shape[0]
+
+    def __getitem__(self, idx: int) -> dict:
+        input_ids = self.tokens[idx]
+        return {"input_ids": input_ids, "labels": input_ids.clone()}
 
 
 class Wikipedia2021Dataset(Dataset):
@@ -434,6 +531,69 @@ class FineWebEduDataset(Dataset):
         }
 
 
+class NemotronCCCodeDataset(Dataset):
+    """NVIDIA Nemotron-CC-Code-v1 via streaming.
+
+    The dataset is gated on Hugging Face. ``token=True`` makes the datasets
+    library use the user's configured HF token without embedding credentials
+    in this repository or in Slurm scripts.
+    """
+
+    def __init__(
+        self,
+        split: str,
+        tokenizer,
+        seq_len: int = 512,
+        max_tokens: int = 200_000_000,
+        seed: int = 42,
+    ):
+        self.seq_len = seq_len
+        from datasets import load_dataset
+
+        ds = load_dataset(
+            "nvidia/Nemotron-CC-Code-v1",
+            name="data",
+            split="train",
+            streaming=True,
+            token=True,
+        )
+        if split != "train" and hasattr(ds, "shuffle"):
+            ds = ds.shuffle(seed=seed + 10000, buffer_size=10_000)
+        elif hasattr(ds, "shuffle"):
+            ds = ds.shuffle(seed=seed, buffer_size=10_000)
+
+        all_ids: list[int] = []
+        n_docs = 0
+        for example in ds:
+            text = str(example.get("text", "") or example.get("content", "") or "")
+            if text.strip():
+                all_ids.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
+                n_docs += 1
+            if len(all_ids) >= max_tokens:
+                all_ids = all_ids[:max_tokens]
+                break
+            if n_docs and n_docs % 10_000 == 0:
+                print(
+                    f"  Nemotron-CC-Code-v1: {len(all_ids):,}/{max_tokens:,} "
+                    f"tokens from {n_docs:,} documents"
+                )
+
+        print(
+            f"  Nemotron-CC-Code-v1 [{split}] loaded: {len(all_ids):,} tokens "
+            f"from {n_docs:,} documents"
+        )
+        n_seqs = len(all_ids) // seq_len
+        self.tokens = torch.tensor(all_ids[: n_seqs * seq_len], dtype=torch.long)
+        self.tokens = self.tokens.view(n_seqs, seq_len)
+
+    def __len__(self) -> int:
+        return self.tokens.shape[0]
+
+    def __getitem__(self, idx: int) -> dict:
+        input_ids = self.tokens[idx]
+        return {"input_ids": input_ids, "labels": input_ids.clone()}
+
+
 class NemotronCCDataset(Dataset):
     """Nemotron-CC v2.1 dataset via streaming.
 
@@ -520,6 +680,8 @@ CORPUS_REGISTRY = {
     "wikitext": WikiTextDataset,
     "wikipedia-2021": Wikipedia2021Dataset,
     "fineweb-edu": FineWebEduDataset,
+    "general-mixed": GeneralMixedDataset,
+    "nemotron-cc-code": NemotronCCCodeDataset,
     "nemotron-cc": NemotronCCDataset,
 }
 
@@ -550,7 +712,8 @@ def get_dataloader(
         shuffle: Whether to shuffle
         num_workers: DataLoader workers
         seed: Random seed for shuffling
-        corpus: "wikitext", "wikipedia-2021", "fineweb-edu", or "nemotron-cc"
+        corpus: "wikitext", "wikipedia-2021", "fineweb-edu", "general-mixed",
+            "nemotron-cc-code", or "nemotron-cc"
         corpus_subset: Subset for nemotron-cc (hq-dqa, hq, mhq, all)
         wikipedia2021_dataset: Optional override for the pre-tokenized
             Wikipedia-2021 dataset repo.
@@ -572,7 +735,7 @@ def get_dataloader(
         seq_len=seq_len,
         max_tokens=max_tokens,
     )
-    if corpus in ("fineweb-edu", "nemotron-cc"):
+    if corpus in ("fineweb-edu", "general-mixed", "nemotron-cc-code", "nemotron-cc"):
         kwargs["seed"] = seed
     if corpus == "nemotron-cc":
         kwargs["subset"] = corpus_subset

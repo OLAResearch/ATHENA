@@ -16,11 +16,33 @@ from scripts.train_counterfactual_router import (
     gold_token_log_probs,
     get_calibration_thresholds,
     initialize_distillation_router,
+    parse_args,
     router_weight_stats,
     run_router_probe,
     tri_counterfactual_distillation_loss,
 )
 from engram.tri_memory import TriMemoryAdaptor
+
+
+def test_counterfactual_router_accepts_wikitext_corpus(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train_counterfactual_router.py",
+            "--corpus",
+            "wikitext",
+            "--adaptor-dir",
+            "adaptor",
+            "--source-memory",
+            "memory.pt",
+            "--memory-config",
+            "memory.json",
+            "--output-dir",
+            "out",
+        ],
+    )
+
+    assert parse_args().corpus == "wikitext"
 
 
 def test_calibration_thresholds_follow_reader_contract():

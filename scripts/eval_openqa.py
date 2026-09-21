@@ -960,6 +960,12 @@ def setup_condition(args, condition: str, device: torch.device, dtype: torch.dty
     else:
         raise ValueError(f"Unsupported condition: {condition}")
 
+    if condition in ("random_memory", "permuted_keys"):
+        saved_memory = Path(args.adaptor_dir) / "memory.pt"
+        if not saved_memory.exists():
+            raise FileNotFoundError("Content ablations require the exact training memory.pt")
+        memory.load_state_dict(torch.load(saved_memory, map_location="cpu", weights_only=True))
+
     mode_contract = resolve_reader_mode_contract(
         getattr(args, "dual_reader_mode", "auto"), adaptor_cfg, condition=condition
     )
@@ -1035,6 +1041,7 @@ def greedy_generate(
     stop_at_newline: bool = True,
     temperature: float = 0.0,
     top_p: float = 1.0,
+    routing_collector=None,
 ) -> str:
     """Generate one continuation, optionally using nucleus sampling.
 
@@ -1079,6 +1086,8 @@ def greedy_generate(
                 past_key_values=past_key_values,
                 use_cache=True,
             )
+            if routing_collector is not None:
+                routing_collector.add_last_token(wrapper)
             logits = outputs.logits[:, -1, :]
             if temperature == 0.0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
@@ -1119,6 +1128,7 @@ def compute_continuation_logprob(
     max_context_length: int,
     official_tokenization: bool,
     normalize: bool = False,
+    routing_collector=None,
 ) -> float:
     tokenize_kwargs = {"return_tensors": "pt"}
     if not official_tokenization:
@@ -1149,6 +1159,8 @@ def compute_continuation_logprob(
     with torch.no_grad():
         outputs = wrapper(input_ids=full_ids)
         logits = outputs.logits
+    if routing_collector is not None:
+        routing_collector.add_slice(wrapper, logit_start, full_len - 1)
 
     continuation_logits = logits[0, logit_start: full_len - 1, :]
     continuation_targets = full_ids[0, score_start:full_len]
@@ -1170,6 +1182,7 @@ def evaluate_openqa(
     max_context_length: int,
     reasoning_mode: str = "vanilla",
     retain_all_predictions: bool = False,
+    routing_collector=None,
 ) -> dict:
     correct = 0
     f1_values = []
@@ -1197,6 +1210,7 @@ def evaluate_openqa(
             max_context_length=max_context_length,
             official_tokenization=official_tokenization,
             stop_at_newline=(reasoning_mode == "vanilla"),
+            routing_collector=routing_collector,
         )
         raw_prediction = prediction
         if reasoning_mode == "cot":
@@ -1311,6 +1325,7 @@ def evaluate_truthfulqa(
     device: torch.device,
     max_context_length: int,
     retain_all_examples: bool = False,
+    routing_collector=None,
 ) -> dict:
     totals = {"MC1": 0.0, "MC2": 0.0, "MC3": 0.0}
     sample_examples = []
@@ -1330,6 +1345,7 @@ def evaluate_truthfulqa(
                 max_context_length=max_context_length,
                 official_tokenization=official_tokenization,
                 normalize=False,
+                routing_collector=routing_collector,
             )
             for answer in ex["correct_answers"]
         ]
@@ -1344,6 +1360,7 @@ def evaluate_truthfulqa(
                 max_context_length=max_context_length,
                 official_tokenization=official_tokenization,
                 normalize=False,
+                routing_collector=routing_collector,
             )
             for answer in ex["incorrect_answers"]
         ]

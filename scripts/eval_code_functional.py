@@ -286,6 +286,10 @@ def evaluate_bigcodebench(records: list[dict], output_dir: Path, parallel: int):
         calibrated=False,
         parallel=parallel,
         min_time_limit=1,
+        # The official evaluator's ground-truth timing pass is an optional
+        # calibration check.  It is not needed for model pass@k and can fail
+        # under the networkless Apptainer multiprocessing boundary.
+        no_gt=True,
     )
     pass_path = Path(str(official_samples).replace(".jsonl", "_pass_at_k.json"))
     eval_path = Path(str(official_samples).replace(".jsonl", "_eval_results.json"))

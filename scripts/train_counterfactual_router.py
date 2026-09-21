@@ -1,4 +1,4 @@
-"""Distill a task-agnostic Engram/Both selector from raw Wikipedia spans.
+"""Distill a task-agnostic Engram/Both selector from raw corpus spans.
 
 The two memory experts stay frozen.  For every Wikipedia sequence, the script
 measures which expert assigns higher likelihood to the real future tokens and
@@ -153,12 +153,16 @@ def parse_args():
             "0.00,0.01,0.02,0.05,0.10,0.20,0.30,0.50"
         ),
         help=(
-            "Wikipedia validation grid for predicted loss advantage. "
+            "Validation grid for predicted loss advantage. "
             "This is separate from the legacy binary-router probability grid."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--corpus", choices=["wikipedia-2021"], default="wikipedia-2021")
+    parser.add_argument(
+        "--corpus",
+        choices=["wikitext", "wikipedia-2021", "general-mixed", "nemotron-cc-code"],
+        default="wikipedia-2021",
+    )
     parser.add_argument("--wikipedia2021-dataset", default=None)
     parser.add_argument("--wikipedia2021-source-tokenizer", default=None)
     parser.add_argument("--wikipedia2021-require-tokenizer-match", action="store_true")
@@ -173,6 +177,12 @@ def parse_args():
     parser.add_argument("--advantage-max-scale", type=float, default=1.0)
     parser.add_argument("--advantage-regression-weight", type=float, default=1.0)
     parser.add_argument("--advantage-confidence-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop after this many validation checks without improvement; 0 disables it.",
+    )
     return parser.parse_args()
 
 
@@ -232,7 +242,12 @@ def _is_tri_config(source_config: dict) -> bool:
         or source_config.get("fusion_type") == "tri_reader"
         or any(
             bool(source_config.get(key))
-            for key in ("joint_tri_reader", "joint_tri_subset_reader", "joint_tri_route_only")
+            for key in (
+                "joint_tri_reader",
+                "joint_tri_subset_reader",
+                "joint_tri_experts_only",
+                "joint_tri_route_only",
+            )
         )
     )
 
@@ -249,7 +264,10 @@ def _build_tri_wrapper(args, device: torch.device, dtype: torch.dtype):
         hash_seed=memory_config_dict.get("hash_seed", 42),
     )
     memory = EngramMemory(memory_config)
-    memory.load_state_dict(torch.load(args.source_memory, map_location="cpu", weights_only=True))
+    memory_path = Path(args.adaptor_dir) / "memory.pt"
+    if not memory_path.exists():
+        memory_path = Path(args.source_memory)
+    memory.load_state_dict(torch.load(memory_path, map_location="cpu", weights_only=True))
     for parameter in memory.parameters():
         parameter.requires_grad = False
 
@@ -260,7 +278,7 @@ def _build_tri_wrapper(args, device: torch.device, dtype: torch.dtype):
     wrapper = BackboneWrapper(
         model_name=args.target_model,
         memory=memory,
-        condition="transferred",
+        condition=source_config.get("condition", "transferred"),
         device=device,
         dtype=dtype,
         injection_layers=parse_injection_layers(source_config.get("injection_layers")),
@@ -989,12 +1007,14 @@ def main_tri(args) -> None:
             "max_scale": args.advantage_max_scale,
         },
         "deployment_reader_mode": "tri_advantage_routed",
-        "router_strategy": "wikipedia_counterfactual_tri_advantage_distillation",
-        "router_training_data": "wikipedia-2021-causal-next-token-only",
+        "router_strategy": "counterfactual_tri_advantage_distillation",
+        "router_training_data": f"{args.corpus}-causal-next-token-only",
         "downstream_training_examples": 0,
         "source_expert_checkpoint": checkpoint,
         "experts_frozen": True,
     })
+    if source_config.get("condition") in ("random_memory", "permuted_keys", "train_from_scratch"):
+        torch.save(wrapper.memory.state_dict(), output_dir / "memory.pt")
     config_path = output_dir / "config.json"
     config_path.write_text(json.dumps(runtime_config, indent=2))
     log_handle = open(output_dir / "train_log.jsonl", "w")
@@ -1003,9 +1023,11 @@ def main_tri(args) -> None:
     best_estimated_advantage = -float("inf")
     best_step = 0
     best_calibration = None
+    no_improvement_evals = 0
+    early_stopped = False
     started = time.time()
     running = {"loss": 0.0, "steps": 0}
-    while step < total_steps:
+    while step < total_steps and not early_stopped:
         epoch += 1
         for batch in train_loader:
             if step >= total_steps:
@@ -1068,7 +1090,25 @@ def main_tri(args) -> None:
                 if estimated > best_estimated_advantage:
                     best_estimated_advantage = estimated; best_step = step; best_calibration = calibration
                     save_checkpoint(wrapper, output_dir, "adaptor_best.pt")
-                print(f">> Wikipedia tri validation threshold={calibration['selected_threshold']:.2f}; advantage/token={estimated:.6f}")
+                    no_improvement_evals = 0
+                else:
+                    no_improvement_evals += 1
+                print(
+                    f">> {args.corpus} tri validation "
+                    f"threshold={calibration['selected_threshold']:.2f}; "
+                    f"advantage/token={estimated:.6f}; "
+                    f"no_improvement_evals={no_improvement_evals}"
+                )
+                if (
+                    args.early_stopping_patience > 0
+                    and no_improvement_evals >= args.early_stopping_patience
+                ):
+                    early_stopped = True
+                    print(
+                        f">> Early stopping after {step} steps / "
+                        f"{step * tokens_per_step:,} training tokens"
+                    )
+                    break
     log_handle.close()
     if best_step == 0:
         raise RuntimeError("Tri advantage reader never produced a validation checkpoint")
@@ -1093,14 +1133,29 @@ def main_tri(args) -> None:
     runtime_config["advantage_reader"]["threshold"] = selected_threshold
     runtime_config["best_step"] = best_step
     config_path.write_text(json.dumps(runtime_config, indent=2))
-    validation = evaluate_tri_ppl(
-        wrapper, set_canon_fn, val_loader, device,
-        ("engram_only", "tri_soft_fused", "tri_routed", "tri_advantage_routed"),
-    )
+    if source_config.get("joint_tri_experts_only", False):
+        validation_modes = (
+            "engram_only",
+            "generated_from_engram_only",
+            "generated_from_context_only",
+            "tri_advantage_routed",
+        )
+    else:
+        validation_modes = (
+            "engram_only",
+            "tri_soft_fused",
+            "tri_routed",
+            "tri_advantage_routed",
+        )
+    validation = evaluate_tri_ppl(wrapper, set_canon_fn, val_loader, device, validation_modes)
     results = {
-        "completed": True, "training_design": "wikipedia_counterfactual_tri_advantage_distillation",
-        "training_data": "wikipedia-2021-causal-next-token-only", "downstream_training_examples": 0,
+        "completed": True, "training_design": "counterfactual_tri_advantage_distillation",
+        "training_data": f"{args.corpus}-causal-next-token-only", "downstream_training_examples": 0,
         "max_tokens": args.max_tokens, "actual_steps": step, "best_step": best_step,
+        "tokens_per_step": tokens_per_step,
+        "training_tokens": step * tokens_per_step,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopped": early_stopped,
         "best_estimated_advantage_per_token": best_estimated_advantage,
         "selected_threshold": selected_threshold, "calibration": final_calibration,
         "validation": validation, "trainable_names": trainable_names,
@@ -1109,7 +1164,7 @@ def main_tri(args) -> None:
     }
     (output_dir / "results.json").write_text(json.dumps(results, indent=2))
     save_checkpoint(wrapper, output_dir, "adaptor.pt")
-    print("ATHENA_WIKIPEDIA_COUNTERFACTUAL_TRI_ADVANTAGE_TRAINING_COMPLETE")
+    print("ATHENA_COUNTERFACTUAL_TRI_ADVANTAGE_TRAINING_COMPLETE")
     wrapper.cleanup()
 
 
@@ -1201,7 +1256,7 @@ def main():
         "generator_router_semantic_size": args.router_semantic_size,
         "router_experts": ["engram_only", "engram_plus_generated_residual"],
         "router_strategy": "wikipedia_counterfactual_span_advantage_distillation",
-        "router_training_data": "wikipedia-2021-causal-next-token-only",
+        "router_training_data": f"{args.corpus}-causal-next-token-only",
         "router_hard": True,
         "router_min_generated_probability": 0.5,
         "downstream_training_examples": 0,
@@ -1306,7 +1361,7 @@ def main():
                 )
                 estimated_advantage = calibration["estimated_advantage_per_token"]
                 print(
-                    f">> Wikipedia validation distill={calibration['distillation_loss']:.4f}; "
+                    f">> {args.corpus} validation distill={calibration['distillation_loss']:.4f}; "
                     f"threshold={calibration['selected_threshold']:.2f}; "
                     f"estimated advantage/token={estimated_advantage:.6f}"
                 )
@@ -1355,12 +1410,12 @@ def main():
             "ppl": ppl,
             "router_weights": weights if mode == "routed" else None,
         }
-        print(f"FINAL Wikipedia validation {mode}: PPL={ppl:.4f}")
+        print(f"FINAL {args.corpus} validation {mode}: PPL={ppl:.4f}")
 
     results = {
         "completed": True,
         "training_design": "wikipedia_counterfactual_span_advantage_distillation",
-        "training_data": "wikipedia-2021-causal-next-token-only",
+        "training_data": f"{args.corpus}-causal-next-token-only",
         "downstream_training_examples": 0,
         "max_tokens": args.max_tokens,
         "teacher_forward_tokens": args.max_tokens * 2,

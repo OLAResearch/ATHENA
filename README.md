@@ -1,123 +1,124 @@
-<h1 align="center">ATHENA</h1>
-<p align="center"><strong>Adaptive THeoretical Engram Network Architecture</strong></p>
+# MemoryAthena
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-4D7C0F?style=flat-square" alt="Apache 2.0 license"></a>
-  <a href="https://github.com/MJLee00/ATHENA/stargazers"><img src="https://img.shields.io/github/stars/MJLee00/ATHENA?style=flat-square" alt="GitHub stars"></a>
-</p>
+MemoryAthena studies adaptive, multi-path Engram memory: a frozen or jointly
+trained external memory is read through three complementary pathways—E, GE,
+and GH—and an E-anchored router decides when generated memory should be
+admitted and interpolated.
 
-<p align="center">
-  ATHENA studies whether a frozen Engram-style external memory remains useful after it is
-  detached from the model that trained it and attached to a different backbone. The central result
-  is a reader-first view of memory portability: the stored table matters, but successful transfer
-  depends on a lightweight target-side reader that can extract and align the signal.
-</p>
+The repository contains the model components, training/evaluation entry
+points, tests, and paper-facing evidence notes. The organization of the
+artifact documentation is inspired by the reproducibility-oriented structure
+of [XMemTransfer](https://github.com/OLAResearch/XMemTransfer), but the code
+and experiments here are independent.
 
-## Framework
+## What is in the repository
 
-<p align="center">
-  <a href="overview.pdf">
-    <img src="overview.png" alt="XMemTransfer framework figure" width="980">
-  </a>
-</p>
-
-<p align="center">
-  <a href="overview.pdf"><strong>Open the full framework figure (PDF)</strong></a>
-</p>
-
-The transfer protocol has two stages:
-
-1. Train a source-side Engram memory and freeze the learned memory table.
-2. Attach that frozen table to a different target model and train only a lightweight target-side reader.
-
-## Results Snapshot
-
-Headline results from the saved project artifacts:
-
-- All cells in the full 3 x 3 source-target transfer matrix are positive.
-- The strongest intrinsic gain reaches `-15.7%` relative perplexity reduction.
-- A stronger dual-layer 4-branch reader reaches `38.78` average OpenQA score in the saved Mistral artifacts.
-
-Selected intrinsic transfer results:
-
-| Source memory | Target model | Baseline PPL | Transferred PPL | Relative change |
-| --- | --- | ---: | ---: | ---: |
-| Pythia-160M | Pythia-410M | 21.900 | 21.559 | -1.6% |
-| Pythia-160M | Qwen3.5-4B | 10.812 | 10.079 | -6.8% |
-| Pythia-160M | TinyLlama-1.1B | 10.630 | 9.502 | -10.6% |
-| Qwen3.5-0.8B | Pythia-410M | 22.936 | 21.375 | -6.8% |
-| Qwen3.5-0.8B | Qwen3.5-4B | 10.524 | 9.585 | -8.9% |
-| Qwen3.5-0.8B | TinyLlama-1.1B | 10.784 | 9.096 | -15.7% |
-
-Selected downstream gains reported in the paper:
-
-| Target | RTE | BoolQ | OpenBookQA | SciQ | TruthfulQA | RACE |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Qwen3.5-2B | +3.5 +/- 1.9 | +3.9 +/- 1.4 | +0.6 +/- 0.4 | +3.7 +/- 0.6 | -0.5 +/- 0.3 | -0.1 +/- 0.1 |
-| Qwen3.5-9B | +0.7 +/- 0.3 | +0.6 +/- 0.2 | +0.3 +/- 0.3 | +3.2 +/- 0.7 | -0.8 +/- 0.3 | +1.1 +/- 0.2 |
-
-OpenQA highlights from the saved reviewer-validation summary:
-
-| Setting | Average score | Notes |
-| --- | ---: | --- |
-| Cross-model, R4, 30M/30M | 38.78 | Best saved cross-model OpenQA artifact |
-| Same-model, R4 | 38.53 | Same-model reference |
-| Cross-model, R4, 20M/20M | 38.48 | Stronger reader nearly closes the same-model gap |
-
-## Quickstart
-
-Prerequisites: Python >= 3.11, a CUDA-capable GPU, and `uv`.
-
-```bash
-bash run/00_install.sh
-bash run/01_pilot.sh
-```
-
-The pilot validates the end-to-end pipeline on a compact transfer setting before larger runs.
-
-## Reproducing the Paper
-
-Experiments are grouped by paper section under `run/`.
-
-| Paper section | Command |
+| Area | Location |
 | --- | --- |
-| Tier 1 same-tokenizer | `bash run/10_tier1_same_tokenizer.sh` |
-| Tier 2 cross-tokenizer | `bash run/11_tier2_cross_tokenizer.sh` |
-| Tier 3 ablations | `bash run/12_tier3_ablations.sh` |
-| Tier 4 scaling | `bash run/13_tier4_scaling.sh` |
-| Extended CKA | `bash run/14_cka_extended.sh` |
-| Downstream evaluation | `bash run/20_downstream_fw_matched.sh` |
-| Domain alignment | `bash run/21_domain_alignment.sh` |
-| Corpus control | `bash run/22_corpus_control.sh` |
-| Baselines | `bash run/30_baselines.sh` |
-| Figures and analysis | `bash run/40_analysis.sh` |
+| Memory, readers, routing, and HF utilities | [`engram/`](engram/) |
+| Training, evaluation, and analysis entry points | [`scripts/`](scripts/) |
+| Small tracked configs and probe data | [`configs/`](configs/), [`data/`](data/) |
+| Smoke tests and unit tests | [`tests/`](tests/) |
+| Reproduction wrappers | [`run/`](run/) |
+| Paper-to-artifact ledger | [`ARTIFACTS.md`](ARTIFACTS.md) |
+| Offline experiment dashboard | [`web/index.html`](web/index.html) |
 
-Source memories must be prepared before transfer runs:
+The source paper is maintained locally as `paper/ICLR_submit.tex`. The paper
+tree and large experiment outputs are intentionally excluded from the public
+source checkout; `ARTIFACTS.md` records their run-family names and verification
+status without embedding private workstation or scratch paths.
+
+## Method at a glance
+
+1. Learn or import an Engram-style source memory.
+2. Adapt generated-memory readers while keeping the configured backbone and
+   memory fixed for the adaptation stage.
+3. Train a compact E-relative advantage router from causal-text counterfactual
+   supervision, not downstream task labels.
+4. Freeze the system for downstream evaluation. Labels are used for final
+   scoring and explicitly marked post-hoc analyses only.
+
+The main Mistral configuration injects memory at layers 2 and 10 with a
+four-branch reader. The appendix reports the exact training budgets, routing
+thresholds, architecture, and checkpoint-selection rules.
+
+## Scaling configuration
+
+Scaling is joint model-side scaling, not only “make the memory table larger”:
+the backbone, Engram table, generated-memory modules, readers, and router are
+scaled together. The memory-side count excludes the backbone.
+
+| Scale | Backbone | Engram | Generator | Readers | Router | Memory-side total |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Small | 124M | 33.554M | 256 / 2 / 4 | 16 | 64 | 37.573M |
+| Medium | 345M | 93.716M | 428 / 2 / 6 | 24 | 104 | 104.008M |
+| Large | 774M | 209.715M | 640 / 3 / 8 | 40 | 160 | 238.212M |
+| XL | 1.5B | 405.537M | 896 / 4 / 12 | 56 | 224 | 472.912M |
+
+The current scaling evidence is deliberately reported as a partial artifact
+set until every memory, expert, and final router point has the same verified
+corpus, budget, checkpoint, and completion metadata. See the scaling section in
+[`ARTIFACTS.md`](ARTIFACTS.md).
+
+## Reproduce locally
+
+The project uses Python 3.11+ and `uv` for dependency management.
 
 ```bash
-bash run/02_source_memories.sh
+uv sync
+uv run python -m py_compile engram/*.py scripts/*.py
+uv run pytest -q
 ```
 
-See [run/README.md](run/README.md) for runtime estimates and ordering constraints.
+For a small end-to-end smoke run, inspect the wrappers under [`run/`](run/)
+before launching them. Large training and evaluation runs are designed for
+the CSC cluster and should be submitted only after local syntax/tests and the
+resource-minimization audit pass.
 
-## Repository Layout
+Useful entry points include:
 
 ```text
-.
-├── engram/        Core library (memory, adaptor, canonicalization, hashing, gating)
-├── scripts/       Training, evaluation, and analysis entry points
-├── configs/       YAML configs for experiment groups
-├── tests/         Unit and integration coverage
-├── run/           Section-level shell wrappers
-├── lumi_scripts/  LUMI submission helpers
-├── data/          Saved Phase 0 data and configs
-└── assets/        README figures
+scripts/eval_openqa.py
+scripts/eval_general_paper_aligned.py
+scripts/eval_general_nlp_halueval.py
+scripts/eval_scaling_backbone.py
+scripts/eval_case_study.py
+scripts/eval_code_functional.py
+scripts/benchmark_compute_cost_eonly.py
 ```
 
-## GitHub Star History
+The compute-cost benchmark measures E-only versus MemoryAthena inference
+latency, tokens/s, peak CUDA memory, Slurm elapsed time, and actual GCD-hours.
+It is an inference-only measurement; values should be quoted only after the
+corresponding Slurm result and completion marker exist.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=MJLee00/ATHENA&type=Date)](https://star-history.com/#MJLee00/ATHENA&Date)
+## Evidence and limitations
+
+Read [`ARTIFACTS.md`](ARTIFACTS.md) before using a number in a paper. The
+current audit records several important boundaries:
+
+- the historical Vanilla NLP row used a different scorer from the E/router
+  rows and is not a matched headline baseline;
+- the Yahoo high-threshold result is a post-hoc test-set threshold sweep and
+  must be labeled as such;
+- the transfer results lack a matched bare target-Llama baseline;
+- HaluEval uses a separate choice-log-probability protocol;
+- coding functional accuracy and the complete routed downstream comparison are
+  not interchangeable with lexical PPL/F1 diagnostics;
+- scaling and compute-cost claims remain conditional on the completion and
+  validation status recorded in the ledger.
+
+No training token, private cluster path, or credential belongs in a public
+README. Raw logs, checkpoints, and job manifests remain outside the source
+checkout.
+
+## Offline dashboard
+
+Open [`web/index.html`](web/index.html) directly in a browser. It has no CDN,
+build step, or network dependency and presents the paper result map, scaling
+configuration, case-study status, and compute-cost job state. The dashboard is
+a local viewing aid, not a replacement for the raw JSON artifacts.
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache 2.0. See [`LICENSE`](LICENSE).

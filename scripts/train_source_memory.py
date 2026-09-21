@@ -35,6 +35,7 @@ from engram.hashing import HashConfig, WordNgramHasher
 from engram.data import get_dataloader
 from engram.metrics import compute_perplexity
 from engram.gate_analyzer import GateAnalyzer
+from scripts.train_adaptor import enable_frozen_backbone_gradient_checkpointing
 
 
 def parse_args():
@@ -79,7 +80,10 @@ def parse_args():
     parser.add_argument("--early-stopping-patience", type=int, default=0,
                         help="Stop after N evals without val PPL improvement (0=disabled)")
     parser.add_argument("--corpus", type=str, default="wikitext",
-                        choices=["wikitext", "wikipedia-2021", "fineweb-edu", "nemotron-cc"],
+                        choices=[
+                            "wikitext", "wikipedia-2021", "fineweb-edu", "general-mixed",
+                            "nemotron-cc-code", "nemotron-cc",
+                        ],
                         help="Training corpus (default: wikitext)")
     parser.add_argument("--corpus-subset", type=str, default="hq-dqa",
                         help="Subset for nemotron-cc: hq-dqa, hq, mhq, all (default: hq-dqa)")
@@ -207,8 +211,8 @@ def main():
 
     # Enable gradient checkpointing (reduces activation memory for larger models)
     if args.gradient_checkpointing:
-        wrapper.backbone.gradient_checkpointing_enable()
-        print("Gradient checkpointing ENABLED")
+        enable_frozen_backbone_gradient_checkpointing(wrapper)
+        print("Gradient checkpointing ENABLED with differentiable frozen inputs")
 
     # Configure freezing
     if args.freeze_backbone:

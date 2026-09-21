@@ -3,9 +3,9 @@
 #SBATCH --partition=small
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=2G
-#SBATCH --time=00:05:00
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
+#SBATCH --time=00:10:00
 #SBATCH --job-name=athena-adv-eval-recover
 #SBATCH --output=/scratch/project_462001493/mingyl/ATHENA/logs/tri_advantage_formal_20260908T133625Z/validate-%j.out
 #SBATCH --error=/scratch/project_462001493/mingyl/ATHENA/logs/tri_advantage_formal_20260908T133625Z/validate-%j.err

@@ -1,5 +1,6 @@
 """HuggingFace model wrapper with forward hooks for memory injection."""
 
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,37 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .adaptor import build_adaptor
 from .hf_utils import resolve_pretrained_source
 from .memory import EngramMemory
+
+
+def move_backbone_to_device_staged(
+    backbone: nn.Module,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> nn.Module:
+    """Move a decoder-only HF backbone one block at a time.
+
+    LUMI's ROCm stack can SIGSEGV while copying a fully materialized Mistral
+    model with one top-level ``model.to(cuda)`` call.  Moving the embedding,
+    each transformer block, normalization, and output head separately keeps
+    the exact same model placement while avoiding that large monolithic copy.
+    Models without the usual ``model.layers`` layout retain the normal path.
+    """
+    if device.type != "cuda":
+        return backbone.to(device)
+    transformer = getattr(backbone, "model", None)
+    layers = getattr(transformer, "layers", None)
+    if transformer is None or layers is None:
+        return backbone.to(device)
+    for name, module in transformer.named_children():
+        if name == "layers":
+            for layer in module:
+                layer.to(device=device, dtype=dtype)
+        else:
+            module.to(device=device, dtype=dtype)
+    for name, module in backbone.named_children():
+        if name != "model":
+            module.to(device=device, dtype=dtype)
+    return backbone
 
 
 class BackboneWrapper(nn.Module):
@@ -63,9 +95,30 @@ class BackboneWrapper(nn.Module):
         # models that actually need it (e.g., Qwen).
         needs_remote_code = "Phi" not in model_name
         pretrained_source = resolve_pretrained_source(model_name)
-        self.backbone = AutoModelForCausalLM.from_pretrained(
-            pretrained_source, torch_dtype=dtype, trust_remote_code=needs_remote_code,
-        ).to(device)
+        cpu_load_dtype = (
+            torch.float32
+            if device.type == "cuda" and os.environ.get("ATHENA_CPU_FP32_LOAD") == "1"
+            else dtype
+        )
+        model_kwargs = dict(
+            torch_dtype=cpu_load_dtype,
+            trust_remote_code=needs_remote_code,
+        )
+        if device.type == "cuda" and os.environ.get("ATHENA_STAGED_DEVICE_TRANSFER") == "1":
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                pretrained_source, **model_kwargs
+            )
+            self.backbone = move_backbone_to_device_staged(self.backbone, device, dtype=dtype)
+        elif device.type == "cuda" and os.environ.get("ATHENA_DIRECT_DEVICE_MAP") == "1":
+            # On LUMI ROCm, moving a fully materialized Mistral checkpoint via
+            # model.to(cuda) can SIGSEGV before any adaptor/checkpoint code
+            # runs. Accelerate's direct placement avoids that whole-model copy.
+            model_kwargs.update(device_map={"": str(device)}, low_cpu_mem_usage=True)
+            self.backbone = AutoModelForCausalLM.from_pretrained(pretrained_source, **model_kwargs)
+        else:
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                pretrained_source, **model_kwargs
+            ).to(device=device, dtype=dtype)
         self.tokenizer = AutoTokenizer.from_pretrained(
             pretrained_source, trust_remote_code=needs_remote_code
         )
@@ -121,7 +174,10 @@ class BackboneWrapper(nn.Module):
                 )
                 for _ in self.injection_layers
             ])
-        if self.adaptor is not None:
+        # FFN-only warm starts are loaded by train_adaptor before the large
+        # parameter block is moved to ROCm.  Keeping this adaptor on CPU here
+        # avoids a GPU->CPU transition that can SIGSEGV on LUMI's ROCm stack.
+        if self.adaptor is not None and condition != "ffn_only":
             self.adaptor = self.adaptor.to(device)
 
         # Storage for gate activations (populated by hook)
@@ -177,6 +233,9 @@ class BackboneWrapper(nn.Module):
         # Pythia / GPT-NeoX
         if hasattr(model, "gpt_neox"):
             return model.gpt_neox.layers
+        # OpenAI GPT-2 family (gpt2, gpt2-medium, gpt2-large, gpt2-xl)
+        if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            return model.transformer.h
         # Llama / TinyLlama
         if hasattr(model, "model") and hasattr(model.model, "layers"):
             return model.model.layers
@@ -280,7 +339,7 @@ class BackboneWrapper(nn.Module):
                 # Compute adaptor contribution
                 h_float = hidden_states.float()
                 mem_float = mem_vectors.float() if mem_vectors is not None else None
-                if self.architecture == "generative":
+                if self.architecture == "generative" and self.condition != "ffn_only":
                     cue_mem_float = (
                         cue_mem_vectors.float()
                         if cue_mem_vectors is not None

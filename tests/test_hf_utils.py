@@ -48,6 +48,29 @@ def test_resolve_pretrained_source_returns_cached_snapshot_offline(monkeypatch, 
     assert resolve_pretrained_source("org/model") == str(snapshot)
 
 
+def test_resolve_pretrained_source_finds_complete_hub_snapshot_directly(
+    monkeypatch, tmp_path
+):
+    snapshot = (
+        tmp_path
+        / "models--org--model"
+        / "snapshots"
+        / "commit"
+    )
+    snapshot.mkdir(parents=True)
+    for filename in ("config.json", "tokenizer.json", "model.safetensors"):
+        (snapshot / filename).write_text("{}")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("cache metadata miss")),
+    )
+
+    assert resolve_pretrained_source("org/model") == str(snapshot)
+
+
 def test_resolve_pretrained_source_fails_clearly_when_cache_missing(monkeypatch):
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "true")
 

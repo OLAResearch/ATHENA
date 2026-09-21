@@ -176,11 +176,13 @@ class FFNOnlyAdaptor(nn.Module):
     d_hidden chosen so total params ~= full EngramAdaptor params.
     """
 
-    def __init__(self, d_model: int, target_param_count: int):
+    def __init__(self, d_model: int, target_param_count: int, match_biases: bool = False):
         super().__init__()
         # d_hidden = floor(target_params / (2 * d_model))
         d_hidden = target_param_count // (2 * d_model)
         d_hidden = max(d_hidden, 16)  # minimum hidden dim
+        if match_biases:
+            d_hidden = max(1, round((target_param_count - d_model) / (2 * d_model + 1)))
 
         self.net = nn.Sequential(
             nn.Linear(d_model, d_hidden),
@@ -276,6 +278,20 @@ def build_adaptor(
         raise ValueError(f"Unknown architecture: {architecture}")
     if condition == "baseline":
         return None
+    if condition == "ffn_only" and architecture == "generative" and generator_fusion_type == "tri_reader":
+        # Match all parameters of the full three-source adaptor plus advantage
+        # head; construct on meta so this does not allocate a second model.
+        import inspect
+        values = locals().copy()
+        kwargs = {k: values[k] for k in inspect.signature(build_adaptor).parameters}
+        kwargs["condition"] = "transferred"
+        with torch.random.fork_rng(devices=[]), torch.device("meta"):
+            reference = build_adaptor(**kwargs)
+            reference.configure_advantage_reader(candidates="sources")
+            target = sum(p.numel() for p in reference.parameters())
+        ffn = FFNOnlyAdaptor(d_model=d_model, target_param_count=target, match_biases=True)
+        ffn.matched_tri_parameter_count = target
+        return ffn
     if architecture == "generative" and condition not in ("ffn_only", "memory_only"):
         if generator_fusion_type == "tri_reader":
             from .tri_memory import TriMemoryAdaptor
@@ -284,7 +300,14 @@ def build_adaptor(
                 raise ValueError(
                     "tri_reader fusion requires generator_cue_source='hybrid'"
                 )
-            return TriMemoryAdaptor(
+            tri_class = TriMemoryAdaptor
+            extra = {}
+            if condition in ("no_gate", "affine_stitch"):
+                from .tri_ablation import AblatedTriMemoryAdaptor
+                tri_class = AblatedTriMemoryAdaptor
+                extra["condition"] = condition
+            return tri_class(
+                **extra,
                 d_model=d_model,
                 d_mem=d_mem,
                 reader_type=reader_type,

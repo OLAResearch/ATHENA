@@ -65,7 +65,11 @@ def parse_args():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--tasks", nargs="+", choices=STATIC_TASKS, default=list(STATIC_TASKS))
     parser.add_argument("--canon-mode", choices=["vocab", "word_boundary"], default="word_boundary")
-    parser.add_argument("--dual-reader-mode", choices=["both", "engram_only", "generated_only"], default="both")
+    parser.add_argument(
+        "--dual-reader-mode",
+        choices=["both", "engram_only", "generated_only", "tri_advantage_routed"],
+        default="both",
+    )
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument(
         "--start-index",

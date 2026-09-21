@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>MemoryAthena · offline artifact dashboard</title>
+  <style>
+    :root {
+      --ink: #17212b; --muted: #61707d; --paper: #f6f2e9; --panel: #fffdf8;
+      --line: #d8d1c4; --navy: #12283b; --blue: #31748b; --mint: #8fc7ae;
+      --amber: #e6a84e; --red: #c76a58; --shadow: 0 18px 45px rgba(18, 40, 59, .12);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--paper); font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+    a { color: var(--blue); }
+    .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: 100vh; }
+    aside { position: sticky; top: 0; height: 100vh; padding: 28px 22px; color: #eef6f4; background: var(--navy); }
+    .eyebrow { margin: 0 0 6px; color: var(--mint); font-size: 11px; letter-spacing: .18em; text-transform: uppercase; font-weight: 700; }
+    .brand { margin: 0; font: 700 28px/1.1 Georgia, serif; letter-spacing: -.03em; }
+    .tagline { color: #b7c7cd; font-size: 13px; margin: 12px 0 28px; }
+    nav { display: grid; gap: 6px; }
+    nav button { border: 0; border-radius: 10px; padding: 10px 12px; color: #cbd9dd; background: transparent; text-align: left; font: inherit; cursor: pointer; }
+    nav button:hover, nav button.active { color: #102231; background: var(--mint); }
+    .side-note { position: absolute; right: 22px; bottom: 24px; left: 22px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.18); color: #aabcc2; font-size: 12px; }
+    main { max-width: 1500px; width: 100%; padding: 38px clamp(22px, 5vw, 72px) 70px; }
+    .hero { display: flex; justify-content: space-between; gap: 28px; align-items: end; margin-bottom: 30px; }
+    h1, h2, h3 { font-family: Georgia, serif; font-weight: 700; letter-spacing: -.025em; }
+    h1 { font-size: clamp(34px, 5vw, 64px); line-height: .98; margin: 0; max-width: 720px; }
+    h2 { font-size: 27px; margin: 42px 0 14px; }
+    h3 { font-size: 19px; margin: 0 0 8px; }
+    .lede { max-width: 640px; color: var(--muted); font-size: 17px; }
+    .stamp { flex: 0 0 210px; padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+    .stamp strong { display: block; font-size: 24px; color: var(--navy); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+    .card { padding: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+    .metric { font-size: 30px; font-weight: 750; color: var(--navy); }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .09em; }
+    .tiny { color: var(--muted); font-size: 12px; }
+    .callout { padding: 18px 20px; border-left: 5px solid var(--amber); border-radius: 10px; background: #fff7e8; }
+    .callout strong { color: #734a13; }
+    .scales { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .scale { position: relative; min-height: 170px; overflow: hidden; }
+    .scale::after { content: ''; position: absolute; right: -24px; bottom: -38px; width: 128px; height: 128px; border-radius: 50%; background: rgba(143,199,174,.28); }
+    .scale .metric { position: relative; z-index: 1; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #40515d; background: #eee9df; font-size: 12px; letter-spacing: .07em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; color: #22313a; background: #dfe8e3; font-size: 12px; white-space: nowrap; }
+    .pill.pending { background: #ffebc3; } .pill.partial { background: #f6d7bc; } .pill.disclosure { background: #e2d9f5; }
+    .filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+    .filters button { border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; background: var(--panel); cursor: pointer; }
+    .filters button.active { color: #fff; background: var(--blue); border-color: var(--blue); }
+    .section { display: none; } .section.active { display: block; }
+    .route { display: flex; gap: 6px; align-items: center; margin: 10px 0; }
+    .route span { display: inline-block; height: 12px; border-radius: 3px; }
+    .e { background: var(--blue); } .ge { background: var(--amber); } .gh { background: var(--red); }
+    footer { margin-top: 50px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    @media (max-width: 900px) { .shell { display: block; } aside { position: relative; height: auto; } .side-note { position: static; margin-top: 24px; } .grid, .scales { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 600px) { main { padding: 28px 16px 50px; } .hero { display: block; } .stamp { margin-top: 18px; } .grid, .scales { grid-template-columns: 1fr; } table { display: block; overflow-x: auto; white-space: nowrap; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <p class="eyebrow">offline evidence view</p>
+      <p class="brand">MemoryAthena</p>
+      <p class="tagline">A compact map from paper claims to model, run, and artifact evidence.</p>
+      <nav aria-label="Dashboard sections">
+        <button class="active" data-section="overview">Overview</button>
+        <button data-section="evidence">Evidence ledger</button>
+        <button data-section="scaling">Scaling & parameters</button>
+        <button data-section="case">Case study</button>
+        <button data-section="compute">Compute cost</button>
+      </nav>
+      <div class="side-note">No external requests. Open the raw JSON and paper source for the authoritative record.</div>
+    </aside>
+    <main>
+      <section class="section active" id="overview">
+        <div class="hero">
+          <div><p class="eyebrow">paper artifact dashboard · 2026-09-21</p><h1>Memory is useful when the reader knows when to listen.</h1><p class="lede">MemoryAthena combines Engram memory, generated readers, and an E-anchored router. This local dashboard keeps headline numbers, caveats, and provenance visible together.</p></div>
+          <div class="stamp"><span class="label">Evidence posture</span><strong>Audited, mixed</strong><span class="tiny">Some raw runs remain remote or partial. No unverified estimate is shown as a result.</span></div>
+        </div>
+        <div class="grid">
+          <div class="card"><span class="label">QA router average</span><div class="metric">39.28</div><span class="tiny">Five-task reported configuration; see disclosure notes.</span></div>
+          <div class="card"><span class="label">NLP router average</span><div class="metric">77.22</div><span class="tiny">All thresholds at τ=0; Yahoo sweep is separate.</span></div>
+          <div class="card"><span class="label">Case-study rows</span><div class="metric">3</div><span class="tiny">Current post-processor slice; all realised argmax GH.</span></div>
+          <div class="card"><span class="label">Compute benchmark</span><div class="metric">Queued</div><span class="tiny">E-only vs MemoryAthena, four scales, actual Slurm accounting.</span></div>
+        </div>
+        <h2>Method map</h2><div class="grid">
+          <div class="card"><h3>1 · Memory</h3><p>Learn or import a source-side Engram memory, then preserve its provenance and checkpoint identity.</p></div>
+          <div class="card"><h3>2 · Readers</h3><p>Adapt E, GE, and GH interfaces with the backbone/memory freeze specified by the run.</p></div>
+          <div class="card"><h3>3 · Router</h3><p>Train a compact E-relative advantage head from causal-text counterfactual supervision.</p></div>
+          <div class="card"><h3>4 · Evaluation</h3><p>Freeze inference artifacts; use labels for final scoring and explicitly marked post-hoc diagnostics.</p></div>
+        </div>
+        <h2>Read this before quoting</h2><div class="callout"><strong>Three boundaries matter.</strong> The historical Vanilla NLP scorer is not matched to E/router; Yahoo τ=1.0 is a post-hoc test-set sweep; and the scaling/compute sections are only promoted when completion and accounting artifacts exist.</div>
+      </section>
+
+      <section class="section" id="evidence"><p class="eyebrow">paper → artifact</p><h2>Evidence ledger</h2><p class="lede">The table is a compact reading of <code>ARTIFACTS.md</code>. Status is provenance-aware, not a guess based on a submitted job alone.</p><div class="filters" id="filters"></div><table><thead><tr><th>Paper object</th><th>Artifact chain</th><th>Status</th><th>Interpretation</th></tr></thead><tbody id="evidenceRows"></tbody></table><p class="tiny" style="margin-top:14px">For exact remote paths, resolve <code>&lt;RUN_ROOT&gt;</code> in the local ledger. The public repository intentionally avoids personal scratch paths.</p></section>
+
+      <section class="section" id="scaling"><p class="eyebrow">joint capacity scaling</p><h2>Backbone + memory-side system</h2><p class="lede">Scaling enlarges the backbone and the memory-side system together. It is not just an Engram-parameter sweep.</p><div class="scales" id="scaleCards"></div><h2>What the counts include</h2><table><thead><tr><th>Component</th><th>Scaling behavior</th><th>Interpretation</th></tr></thead><tbody><tr><td>Backbone</td><td>124M → 1.5B</td><td>GPT-2 Small through XL reference family.</td></tr><tr><td>Engram table</td><td>33.554M → 405.537M</td><td>Memory capacity grows with scale.</td></tr><tr><td>Generator / readers</td><td>256/2/4 → 896/4/12; 16 → 56</td><td>Generated-memory interface grows jointly.</td></tr><tr><td>Router</td><td>64 → 224 hidden width</td><td>Small relative to backbone and memory-side capacity.</td></tr></tbody></table><div class="callout" style="margin-top:18px"><strong>Artifact status:</strong> no-memory points are more complete than the final memory/router curve. The dashboard does not convert partial point files into a complete scaling-law claim.</div></section>
+
+      <section class="section" id="case"><p class="eyebrow">post-hoc qualitative slice</p><h2>Case study</h2><div class="grid"><div class="card"><span class="label">Dataset</span><div class="metric" style="font-size:21px">HotpotQA</div><span class="tiny">Distractor context, validation split.</span></div><div class="card"><span class="label">Selected rows</span><div class="metric">3</div><span class="tiny">Base and RAG incorrect; router correct.</span></div><div class="card"><span class="label">Realised argmax</span><div class="metric">GH</div><span class="tiny">E: 0 · GE: 0 · GH: 3 in current slice.</span></div><div class="card"><span class="label">Labels</span><div class="metric" style="font-size:21px">Post-hoc</div><span class="tiny">Not used to configure routing.</span></div></div><h2>Route concentration</h2><div class="card"><div class="route"><span class="e" style="width:0"></span><span class="ge" style="width:0"></span><span class="gh" style="width:100%"></span></div><p><strong>GH 3/3</strong> is the realised argmax distribution in the current verified three-row slice. It is not evidence that E and GE never win elsewhere.</p><p class="tiny">Open the raw local artifact: <a href="../run/case_study_20260920/repair8_results/case_study.md">case_study.md</a> · <a href="../run/case_study_20260920/repair8_results/results.json">results.json</a></p></div></section>
+
+      <section class="section" id="compute"><p class="eyebrow">actual inference accounting</p><h2>E-only vs MemoryAthena</h2><div class="callout"><strong>No estimates here.</strong> The benchmark is submitted behind the current XL router repair. Values become reportable only after results, completion marker, and <code>sacct</code> actuals are present.</div><div class="grid" style="margin-top:18px"><div class="card"><span class="label">Job</span><div class="metric" style="font-size:25px">22221228</div><span class="tiny">small-g · 1 GCD · 7 CPU · 60 GB</span></div><div class="card"><span class="label">Conditions</span><div class="metric" style="font-size:25px">2 × 4</div><span class="tiny">E-only and MemoryAthena across four scales.</span></div><div class="card"><span class="label">Measured</span><div class="metric" style="font-size:20px">Latency + tokens/s</div><span class="tiny">Synchronized elapsed; input/output/total throughput.</span></div><div class="card"><span class="label">Memory</span><div class="metric" style="font-size:20px">CUDA peak</div><span class="tiny">Allocated and reserved peak memory, plus actual GCD-hours.</span></div></div><h2>Benchmark protocol</h2><table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Warmup / measured iterations</td><td>1 / 3</td></tr><tr><td>Generation</td><td>16 new tokens, max context 512</td></tr><tr><td>Precision</td><td>bfloat16</td></tr><tr><td>Accounting</td><td>Slurm elapsed and actual GCD-hours from sacct</td></tr></tbody></table><p class="tiny" style="margin-top:14px">Raw manifest: <a href="../run/compute_cost_benchmark_eonly_20260921/submitted_jobs.json">submitted_jobs.json</a>. The page will be updated once the job produces immutable results.</p></section>
+
+      <footer>MemoryAthena · local static view · related organizational inspiration: <a href="https://github.com/OLAResearch/XMemTransfer">XMemTransfer</a> · source ledger: <a href="../ARTIFACTS.md">ARTIFACTS.md</a></footer>
+    </main>
+  </div>
+  <script>
+    const evidence = [
+      ['Main QA · tab:qa_combined', 'qa_five_task.aggregate.json + five reader-eval results', 'disclosure', 'Five-task numbers are available, but training histories and baseline protocols must remain explicit.'],
+      ['Main NLP · tab:nlp', 'dcpmi_nlp_six_task.aggregate.json + general-paper-aligned results', 'disclosure', 'E/router are same-scorer; historical Vanilla is not a matched headline baseline.'],
+      ['Controls · tab:controls', 'no-gate, permuted-key, random-memory, from-scratch, FFN, affine-stitch runs', 'remote-recorded', 'Keep random-router and random-memory effects separate.'],
+      ['Transfer · fig:transfer-overview', 'Mistral→Llama QA and general-NLP result JSONs', 'disclosure', 'No matched bare target-Llama baseline.'],
+      ['HaluEval · tab:halueval', 'general_nlp_halueval_results.json', 'remote-recorded', 'Separate choice-log-probability protocol; do not merge with dCPMI average.'],
+      ['Scaling · tab:model-scaling-values', '12 no-memory points + partial memory/expert/router point tree', 'partial', 'No complete final router curve is promoted here.'],
+      ['Case study · fig:case-study', 'repair8 candidates/results/status + case_study.md', 'local-audit', 'Exactly three router-correct rows; current realised argmax distribution is GH=3.'],
+      ['Compute · appendix cost analysis', 'job 22221228 E-only vs MemoryAthena benchmark', 'pending', 'Wait for immutable results, marker, and sacct actuals.']
+    ];
+    const esc = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const categories = ['all', ...new Set(evidence.map(x => x[2]))]; let filter = 'all';
+    const filters = document.getElementById('filters'); const rows = document.getElementById('evidenceRows');
+    function renderFilters() { filters.innerHTML = categories.map(c => `<button class="${filter===c?'active':''}" data-filter="${c}">${c}</button>`).join(''); filters.querySelectorAll('button').forEach(b => b.onclick = () => { filter = b.dataset.filter; renderFilters(); renderRows(); }); }
+    function renderRows() { rows.innerHTML = evidence.filter(x => filter==='all' || x[2]===filter).map(x => `<tr><td><strong>${esc(x[0])}</strong></td><td><code>${esc(x[1])}</code></td><td><span class="pill ${esc(x[2])}">${esc(x[2])}</span></td><td>${esc(x[3])}</td></tr>`).join(''); }
+    renderFilters(); renderRows();
+    const scales = [['Small','124M','33.554M','37.573M','256 / 2 / 4','16','64'],['Medium','345M','93.716M','104.008M','428 / 2 / 6','24','104'],['Large','774M','209.715M','238.212M','640 / 3 / 8','40','160'],['XL','1.5B','405.537M','472.912M','896 / 4 / 12','56','224']];
+    document.getElementById('scaleCards').innerHTML = scales.map(s => `<div class="card scale"><span class="label">${s[0]}</span><div class="metric">${s[1]}</div><p><strong>${s[3]}</strong> memory-side</p><p class="tiny">Engram ${s[2]} · Gen ${s[4]} · Readers ${s[5]} · Router ${s[6]}</p></div>`).join('');
+    document.querySelectorAll('nav button').forEach(button => button.onclick = () => { document.querySelectorAll('nav button').forEach(x => x.classList.remove('active')); button.classList.add('active'); document.querySelectorAll('.section').forEach(x => x.classList.remove('active')); document.getElementById(button.dataset.section).classList.add('active'); window.scrollTo({top:0,behavior:'smooth'}); });
+  </script>
+</body>
+</html>

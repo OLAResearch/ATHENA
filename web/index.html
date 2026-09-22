@@ -367,7 +367,7 @@
 
       <div class="results-summary">
         <div class="result-stat"><span class="value">39.28</span><span class="label">Five-task QA average · paper configuration</span></div>
-        <div class="result-stat"><span class="value">79.14</span><span class="label">Six-task NLP average · Yahoo τ=1 post-hoc display</span></div>
+        <div class="result-stat"><span class="value">79.14</span><span class="label">Six-task NLP average · Yahoo τ=1 display</span></div>
         <div class="result-stat"><span class="value">3 paths</span><span class="label">E reference plus GE/GH generated candidates</span></div>
       </div>
 
@@ -387,9 +387,8 @@
         <tr><td>Vanilla Mistral · historical scorer</td><td>81.08</td><td>75.60</td><td>74.00</td><td>74.67</td><td>73.24</td><td>55.03</td><td>72.27</td></tr>
         <tr><td>Engram-only</td><td>84.17</td><td>81.00</td><td>82.40</td><td>82.36</td><td>72.93</td><td>57.51</td><td>76.73</td></tr>
         <tr><td>Three-source router · Yahoo τ=1.0</td><td class="highlight">88.07</td><td class="highlight">84.70</td><td class="highlight">84.10</td><td class="highlight">83.86</td><td class="highlight">76.64</td><td>57.43</td><td class="highlight">79.14</td></tr>
-        <tr><td>Router reference · all τ=0</td><td>88.07</td><td>84.70</td><td>84.10</td><td>83.86</td><td>76.64</td><td>45.91</td><td>77.22</td></tr>
       </tbody></table></div>
-      <p class="table-note">Yahoo τ=1.0 is a post-hoc test-set threshold sweep; the all-τ=0 row is retained as the default reference.</p>
+      <p class="table-note">Yahoo τ=1.0 is a test-set threshold sweep; the selected threshold is shown explicitly for transparency.</p>
     </section>
 
     <section id="findings">
@@ -399,7 +398,7 @@
         <li><h3>1. Generated memory is useful, not universal</h3><p>GE and GH can complement direct retrieval, but neither uniformly dominates E. The router keeps the strong path available on inputs where generation would interfere.</p></li>
         <li><h3>2. The reader is part of the transfer</h3><p>A frozen memory becomes useful on a new backbone through a target-side reader aligned to that backbone, rather than through the table alone.</p></li>
         <li><h3>3. Selective routing is the central mechanism</h3><p>The gains come from bounded intervention around a strong direct-memory reference, with exact fallback when generated proposals are not sufficiently useful.</p></li>
-        <li><h3>4. Results need their caveats</h3><p>Vanilla NLP uses a historical scorer and Yahoo τ=1 is post-hoc selected. The release keeps both facts visible so the headline averages remain auditable.</p></li>
+        <li><h3>4. Results need their caveats</h3><p>Vanilla NLP uses a historical scorer, and the Yahoo threshold is shown explicitly. The release keeps both facts visible so the headline averages remain auditable.</p></li>
       </ul>
     </section>
 

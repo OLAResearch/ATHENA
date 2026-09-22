@@ -1,0 +1,1300 @@
+\section{Limitations and Future Work}
+
+Although \textsc{MemoryAthena} learns when to admit GE or GH from unlabeled
+text, the overall routing system still relies on memory
+pathways, routing features, training objectives, and admission hyperparameters.
+It therefore does not yet provide a fully automatic mechanism for discovering
+which memory representation should be constructed and used for a given input.
+The substantial gap between the deployed router and the gold-label source
+oracle further shows that the available memory pathways contain useful
+complementary information that the current router does not fully exploit.
+Developing more automated routing objectives that can jointly discover useful
+memory candidates, calibrate their utility, and approach oracle-level selection
+without downstream labels is an important direction for future work.
+
+\section{Architecture and routing implementation}\label{app:implementation}
+
+\subsection{Direct and generated pathways}
+
+E directly reads retrieved memory. GE generates a small latent representation from a causal window of Engram cues. GH generates from clean causal backbone states, obtained without memory injection:
+\begin{align}
+ e_t^\ell &=R_E^\ell(h_t^\ell,m_t), \nonumber\\
+ z_{E,t}^\ell &=G^\ell(M_{t-w+1:t};\E),&
+ z_{H,t}^\ell &=G^\ell(H^{0,\ell}_{t-w+1:t};H), \label{eq:sources}\\
+ g_{\mathrm{GE},t}^\ell &=R_{GE}^\ell(h_t^\ell,z_{E,t}^\ell),&
+ g_{\mathrm{GH},t}^\ell &=R_{GH}^\ell(h_t^\ell,z_{H,t}^\ell).\nonumber
+\end{align}
+Reader notation subsumes projections, branch aggregation, and output gates. Generated paths share components and use source embeddings and low-rank adaptations. GE is grounded in retrieved cues, whereas GH can propose a representation when the table is unhelpful. This creates potential complementarity, but also makes strong performance with corrupted memory possible.
+
+The evaluated Mistral configuration injects memory at layers 2 and 10. Memory dimension is 512 and the reader has four branches. Each generator produces four latents from a three-position causal window, with width 256, two layers, and four attention heads. Source-adaptation rank is 16. GH requires a clean backbone computation in the current implementation, and freezing its parameters does not remove this inference cost.
+
+\subsection{Memory learning and reader adaptation}
+
+Training comprises three optimization stages followed by frozen evaluation. Stage 1 learns the table and source adaptor with the source backbone fixed:
+\begin{equation}
+ \mathcal L_{\mathrm{mem}}(\phi,\psi_{\mathrm{src}})
+ =-\sum_t\log p_{\theta_{\mathrm{src}},\phi,\psi_{\mathrm{src}}}
+ (x_{t+1}\mid x_{\leq t}).
+ \label{eq:memloss}
+\end{equation}
+The table and canonicalization configuration can be reused, but the source adaptor need not be compatible with another backbone.
+
+Stage 2 freezes the table and target backbone and trains the generators and target-side readers. In the later general-NLP and coding pipeline, each endpoint receives equal-weight causal language-modeling supervision:
+\begin{equation}
+ \mathcal L_{\mathrm{experts}}
+ =-\frac13\sum_{s\in\{\E,\GE,\GH\}}\sum_t
+ \log p_s(x_{t+1}\mid x_{\leq t}).
+ \label{eq:expertloss}
+\end{equation}
+This makes the endpoints usable before their relative advantages are distilled. It does not optimize downstream labels.
+
+The QA checkpoint also contains auxiliary routing modules used to construct the
+baseline inference rules in Table~\ref{tab:qa_combined}.
+\emph{Ordinary hard routing} treats E, GE, and GH as three symmetric candidates
+and selects the single pathway with the highest routing score.
+\emph{Ordinary soft fusion} instead applies learned softmax weights over all
+three pathways and combines their residuals continuously.
+The \emph{subset} variants restrict routing to learned subsets of the available
+pathways. \emph{Subset hard routing} makes a discrete choice within the selected
+subset, whereas \emph{subset soft fusion} uses the learned mixture weights
+within that subset.
+These auxiliary routers are trained as part of the QA reader checkpoint and are
+used only as comparison baselines. In contrast, the final
+\textsc{MemoryAthena} router operates over E, GE, and GH using E-relative
+advantage prediction: E is kept as the anchor, and GE or GH modifies it only
+when the generated pathway is predicted to be beneficial.
+
+\subsection{Counterfactual future-advantage supervision}
+
+Stage 3 freezes the backbone, memory, generators, and readers. Under teacher forcing, the advantage of source $s$ over E is
+\begin{equation}
+ a_{s,t}=\log p_s(x_{t+1}\mid x_{\leq t})
+       -\log p_E(x_{t+1}\mid x_{\leq t}),\qquad a_{E,t}=0.
+ \label{eq:advantage}
+\end{equation}
+A positive advantage corresponds to a lower next-token loss than E. Each endpoint pass forces the same source at all injection sites. The advantage is therefore a full-path counterfactual and cannot be attributed to one layer.
+
+We average over future horizons $\mathcal H=\{1,4,8,16,32\}$. Let $v_j$ indicate a valid target and $\mathcal H_t$ contain horizons with at least one valid target:
+\begin{equation}
+ A_{s,t}=\frac1{|\mathcal H_t|}\sum_{k\in\mathcal H_t}
+ \frac{\sum_{j=0}^{k-1}v_{t+j}a_{s,t+j}}
+      {\sum_{j=0}^{k-1}v_{t+j}} .
+ \label{eq:horizons}
+\end{equation}
+Out-of-range targets are excluded. Future text constructs offline supervision only, so the deployed head sees neither future tokens nor these targets.
+
+At each injection layer, the routing head predicts $\widehat A_{s,t}^\ell$ and confidence logit $c_{s,t}^\ell$ from detached causal features. Features include the hidden state, reader-gate strength, residual magnitudes, pairwise similarities, active-source indicators, and projected semantic features. E's predicted advantage is fixed at zero. The head preserves the E stream while exposing generated alternatives as detached features.
+
+For $s\in\{\GE,\GH\}$, define $u_{s,t}=\clip(|A_{s,t}|,0.01,2)$. The per-position loss is
+\begin{align}
+ L_{s,t}^{\ell}
+ &=\operatorname{SmoothL1}\left(\widehat A_{s,t}^\ell,
+                         \clip(A_{s,t},-2,2)\right) \nonumber\\
+ &\quad+0.25\,\operatorname{BCEWithLogits}
+            \left(c_{s,t}^\ell,\sigma(A_{s,t}/0.15)\right).
+ \label{eq:headloss}
+\end{align}
+We take a valid-position, $u_{s,t}$-weighted average and then average injection-layer heads. Only these heads are optimized, amounting to 534,924 trainable parameters in the audited Mistral runs. Confidence is trained against an advantage-derived soft target, and it is not established to be a calibrated probability of downstream correctness.
+\subsection{E-Anchored Causal Inference}
+
+At each position and injection layer, a generated pathway
+$s\in\{\mathrm{GE},\mathrm{GH}\}$ is considered only if its predicted
+E-relative advantage exceeds $\tau$ and its confidence exceeds $\rho$.
+If both generated pathways are eligible, we select the one with the larger
+predicted advantage.
+%
+For the selected pathway $s^\star$, the intervention strength is
+\begin{equation}
+\alpha_t^\ell =
+a_{\max}
+\operatorname{clip}
+\left(
+\frac{\widehat A_{s^\star,t}^\ell-\tau}{T_\alpha},
+0,1
+\right)
+\sigma(c_{s^\star,t}^\ell),
+\end{equation}
+and the memory residual is
+\begin{equation}
+r_t^\ell
+=
+(1-\alpha_t^\ell)e_t^\ell
++
+\alpha_t^\ell g_{s^\star,t}^\ell .
+\end{equation}
+
+If no generated pathway is admitted, $\alpha_t^\ell=0$ and the model exactly
+recovers the E residual at that injection site. We use
+$\tau=0$, $\rho=0.5$, $T_\alpha=0.15$, and $a_{\max}=1$ by default.
+
+The fallback guarantees recovery of the same-checkpoint E pathway when all
+generated candidates are rejected, but it does not guarantee that every
+admitted intervention improves downstream performance because the router can
+make incorrect predictions.
+%
+For analysis, the corresponding effective pathway weights are
+\begin{equation}
+(w_{\mathrm E},w_{\mathrm{GE}},w_{\mathrm{GH}})
+=
+\left(
+1-\alpha,\,
+\alpha\mathbf{1}[s^\star=\mathrm{GE}],\,
+\alpha\mathbf{1}[s^\star=\mathrm{GH}]
+\right).
+\end{equation}
+These weights measure contribution to the injected residual and should not be
+confused with discrete source-selection frequencies.
+\section{Training Configuration and Model Architecture}
+\label{app:training}
+
+\subsection{Training Configuration}
+
+We use a common budget of 20M processed input positions for each optimization
+stage. The three stages separately learn the memory, adapt the generated-memory
+interfaces, and train the final routing head. During downstream evaluation, all
+model parameters are frozen.
+
+\begin{table}[t]
+\centering
+\caption{
+Training stages and token budgets. Each optimization stage uses at most
+20M processed input positions.
+}
+\label{tab:tokenbudget}
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabularx}{\linewidth}{@{}lXr@{}}
+\toprule
+\textbf{Stage} & \textbf{Trainable components} & \textbf{Budget} \\
+\midrule
+Memory learning
+& Engram memory table and source-side adaptor
+& 20M \\
+
+Memory-interface adaptation
+& GE/GH generators and target-side readers
+& 20M \\
+
+Router training
+& E-relative advantage and confidence heads
+& 20M \\
+
+Evaluation
+& None; all components are frozen
+& -- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+For the QA experiments, the learned source memory is reused rather than
+retrained during the final routing run. Thus, the 20M budget in
+Table~\ref{tab:tokenbudget} describes the budget of each optimization stage in
+the full pipeline, not an additional 20M-token memory-training phase for every
+downstream experiment.
+
+\begin{table}[t]
+\centering
+\caption{
+Router training and inference configuration for the evaluated
+Mistral-7B-v0.3 models.
+}
+\label{tab:routerconfig}
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabularx}{\linewidth}{@{}Xr@{}}
+\toprule
+\textbf{Setting} & \textbf{Value} \\
+\midrule
+Packed sequence length & 2,048 \\
+Training steps & 9,765 \\
+Processed input positions & 19,998,720 \\
+Validation budget & 2,000,000 positions \\
+Trainable router parameters & 534,924 \\
+Router hidden width & 64 \\
+Learning rate & $3\times10^{-4}$ \\
+Batch size & 1 \\
+Warmup steps & 200 \\
+Validation interval & 2,000 steps \\
+\addlinespace
+QA selected checkpoint
+& step 4,000 (8.192M positions) \\
+General-NLP selected checkpoint
+& step 8,000 (16.384M positions) \\
+\addlinespace
+Advantage threshold $\tau$ & 0.0 \\
+Confidence threshold $\rho$ & 0.5 \\
+Maximum interpolation $a_{\max}$ & 1.0 \\
+Interpolation temperature $T_{\alpha}$ & 0.15 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The final checkpoint does not have to coincide with the end of training.
+Router checkpoints are selected using held-out causal-text validation rather
+than downstream task accuracy. The QA router selects the checkpoint at
+8.192M processed positions, while the general-NLP router selects the checkpoint
+at 16.384M positions. The separate Yahoo threshold adjustment is reported
+explicitly because it uses downstream test performance for model selection.
+
+
+\subsection{Architecture Specification}
+
+Table~\ref{tab:architecture} summarizes the memory interface, generated-memory
+modules, and routing head used with Mistral-7B-v0.3.
+
+\begin{table}[t]
+\centering
+\caption{
+Architecture and parameterization of the generated-memory pathways and
+E-anchored router used with Mistral-7B-v0.3.
+}
+\label{tab:architecture}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.08}
+
+\begin{tabularx}{\linewidth}{
+    @{}
+    p{0.30\linewidth}
+    X
+    >{\raggedleft\arraybackslash}p{0.24\linewidth}
+    @{}
+}
+\toprule
+\textbf{Component} & \textbf{Configuration} & \textbf{Value} \\
+\midrule
+
+\multicolumn{3}{@{}l}{\textbf{Memory interface}} \\
+\addlinespace[2pt]
+
+Injection layers
+& Target backbone layers
+& $\{2,10\}$ \\
+
+Memory dimension
+& Retrieved / latent memory width
+& 512 \\
+
+Memory table
+& Frozen Engram parameters
+& 33,554,432 \\
+
+Reader branches
+& Parallel branches per injection layer
+& 4 \\
+
+Direct E reader
+& Parameters per layer / two layers
+& 10,506,244 / 21,012,488 \\
+
+\addlinespace[3pt]
+\midrule
+\multicolumn{3}{@{}l}{\textbf{Generated-memory pathways (GE/GH)}} \\
+\addlinespace[2pt]
+
+Generator context
+& Causal input window
+& 3 positions \\
+
+Generated latents
+& Latent representations per position
+& 4 \\
+
+Generator hidden width
+& Internal representation size
+& 256 \\
+
+Generator depth
+& Transformer layers
+& 2 \\
+
+Generator attention
+& Attention heads
+& 4 \\
+
+Source-specific adaptation
+& Low-rank output adapter
+& $r=16$ \\
+
+Output-adapter shape
+& Bottleneck projection
+& $256 \rightarrow 16 \rightarrow d_{\mathrm{model}}$ \\
+
+GE conditioning
+& Retrieved Engram cues
+& -- \\
+
+GH conditioning
+& Clean causal backbone states
+& -- \\
+
+Generated reader
+& Projection, branch aggregation, and output gating
+& -- \\
+
+\addlinespace[3pt]
+\midrule
+\multicolumn{3}{@{}l}{\textbf{E-anchored router}} \\
+\addlinespace[2pt]
+
+Router architecture
+& MLP hidden width
+& 64 \\
+
+Candidate pathways
+& Generated candidates
+& $\{\mathrm{GE},\mathrm{GH}\}$ \\
+
+Reference pathway
+& Fixed routing anchor
+& E \\
+
+Router outputs
+& E-relative advantage and confidence
+& 2 per candidate \\
+
+Advantage threshold
+& $\tau$
+& 0.0 \\
+
+Confidence threshold
+& $\rho$
+& 0.5 \\
+
+Maximum interpolation
+& $a_{\max}$
+& 1.0 \\
+
+Interpolation temperature
+& $T_{\alpha}$
+& 0.15 \\
+
+\addlinespace[3pt]
+\midrule
+\multicolumn{3}{@{}l}{\textbf{Parameter summary}} \\
+\addlinespace[2pt]
+
+Shared generator
+& Parameters per layer / two layers
+& 3,288,576 / 6,577,152 \\
+
+Generated readers
+& Parameters per layer / two layers
+& 69,625,352 / 139,250,704 \\
+
+Advantage router
+& Parameters per layer / two layers
+& 267,462 / 534,924 \\
+
+Full tri-path adaptor
+& All adaptor and routing parameters per layer
+& 83,960,284 \\
+
+Two-layer adaptor
+& Layers 2 and 10, excluding backbone
+& 167,920,568 \\
+\addlinespace[2pt]
+\textbf{Total memory system}
+& \textbf{Memory table + two-layer adaptor, excluding backbone}
+& \textbf{201,475,000} \\
+
+\bottomrule
+\end{tabularx}
+\end{table}
+\paragraph{Reader and generator training.}
+Stage 2 freezes the memory table and target backbone and optimizes the
+generated-memory modules and target-side readers. For general NLP and coding,
+the three endpoints E, GE, and GH are trained with the equal-weight
+language-modeling objective in Eq.~\ref{eq:expertloss}. This stage contains
+167,364,632 trainable parameters.
+
+The QA reader checkpoint uses the same three endpoints but additionally trains
+auxiliary pair-restricted and subset-fusion modules used by the hard- and
+soft-routing baselines. These auxiliary modules are not additional memory
+sources in the final system: the deployed \textsc{MemoryAthena} router operates
+only over E, GE, and GH. The QA reader/generator stage contains 167,385,644
+trainable parameters and uses routing distillation with coefficient 0.5.
+
+
+\paragraph{Training time.}
+The recorded reader/generator training times are approximately 31.70 hours for
+QA, 16.01 hours for general NLP, and 16.41 hours for coding. Router training
+takes approximately 11.19, 10.58, and 10.94 hours, respectively. These values
+are wall-clock measurements from the corresponding runs. Because router
+training evaluates multiple counterfactual endpoints, and GH additionally uses
+a clean-backbone forward pass, processed-token count alone does not represent
+the total computational cost.
+
+
+\paragraph{General-NLP training data.}
+The general-NLP training corpus uses an equal-token mixture of WikiText-103,
+Amazon Polarity, CC-News, and IMDB. No downstream labels are used for training
+the memory pathways or the router. We nevertheless do not assume that this
+guarantees benchmark decontamination: review corpora may overlap with
+downstream review benchmarks, and the CC-News training and validation streams
+are sampled from the same underlying split rather than from explicitly
+document-disjoint partitions.
+\section{Complete QA Metrics}
+\label{app:qa}
+
+Figure~\ref{fig:qa-summary} summarizes the complete QA comparison using F1 for
+open-QA tasks and the mean multiple-choice score for TruthfulQA. The
+same-checkpoint rows provide the cleanest comparison because they share the same
+memory and expert checkpoints. Standalone Engram and Mistral$\rightarrow$Llama
+serve as additional references but have different training histories.
+
+\begin{figure}[t]
+    \centering
+    \safeincludegraphics[width=\columnwidth]{../../figures/memoryathena_complete_qa_summary.pdf}
+    \caption{
+    Complete QA comparison. Open-QA tasks report F1, and TruthfulQA reports the
+    mean of MC1, MC2, and MC3. Same-checkpoint rows isolate the effect of the
+    inference rule more cleanly than Standalone Engram or
+    Mistral$\rightarrow$Llama.
+    }
+    \label{fig:qa-summary}
+\end{figure}
+
+The E+GE and E+GH pair controls are learned two-source fusion baselines.
+Their mixing weights depend on the input, so they should be interpreted as
+complete learned-fusion systems rather than as isolated measurements of the
+contribution of GE or GH alone.
+
+To make the answer-level behavior explicit, Figure~\ref{fig:qa-emf1} compares
+EM and F1 between same-checkpoint E and \textsc{MemoryAthena}. NQ and WebQA
+improve on both metrics, but TriviaQA and HotpotQA show a different pattern:
+F1 increases while EM decreases. Thus, generated-memory routing can improve
+average answer overlap without necessarily increasing exact-match accuracy.
+
+\begin{figure}[t]
+    \centering
+    \safeincludegraphics[width=\columnwidth]{../../figures/memoryathena_qa_em_f1.pdf}
+    \caption{
+    EM/F1 comparison between same-checkpoint E and \textsc{MemoryAthena} on the
+    open-QA tasks. Numbers above bars show the change from E to
+    \textsc{MemoryAthena}. TriviaQA and HotpotQA exhibit higher F1 but lower EM.
+    }
+    \label{fig:qa-emf1}
+\end{figure}
+
+For TruthfulQA, Table~\ref{tab:truthfulqa-mc} reports the three multiple-choice
+metrics separately.
+
+\begin{table}[h]
+\centering
+\caption{
+TruthfulQA multiple-choice metrics (\%). The summary is the mean of MC1, MC2,
+and MC3.
+}
+\label{tab:truthfulqa-mc}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Condition & MC1 & MC2 & MC3 & Mean\\
+\midrule
+Standalone Engram & 27.42 & 44.32 & 22.69 & 31.47\\
+Same-checkpoint E & 26.93 & 44.18 & 22.64 & 31.25\\
+E/GE learned pair & 27.54 & 43.40 & 22.72 & 31.22\\
+E/GH learned pair & 27.78 & 42.90 & 22.67 & 31.12\\
+\rowcolor{tablefocus}
+\textsc{MemoryAthena} & 28.15 & 44.04 & 23.02 & 31.74\\
+Mistral$\rightarrow$Llama & 27.78 & 41.57 & 21.87 & 30.41\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Finally, Figure~\ref{fig:qa-paired} reports paired F1 changes relative to
+same-checkpoint E. Most examples remain unchanged, while the numbers of
+improved and degraded examples are of similar order. Positive mean F1 gains
+therefore arise from the magnitudes of the changes rather than from uniformly
+one-sided answer flips.
+
+\begin{figure}[t]
+    \centering
+    \safeincludegraphics[width=\columnwidth]{../../figures/memoryathena_qa_paired_changes.pdf}
+    \caption{
+    Paired F1 changes relative to same-checkpoint E. Bars show the fraction of
+    evaluation examples whose F1 improves, degrades, or remains unchanged under
+    \textsc{MemoryAthena}. The right margin reports the mean F1 change.
+    These counts are descriptive only and are not significance tests.
+    }
+    \label{fig:qa-paired}
+\end{figure}
+
+Paired improve/degrade counts alone do not determine the mean score change,
+because the sizes of the answer-level changes can differ substantially.
+We therefore report these counts as descriptive diagnostics only. TruthfulQA is
+excluded from this paired F1 analysis because it does not use token-overlap F1.
+\section{Source-Oracle Analysis}
+\label{app:oracle}
+
+Figure~\ref{fig:oracle-headroom} evaluates the complementarity of the three
+memory pathways using a gold-label oracle. For each example, we run the E, GE,
+and GH endpoints separately and select the endpoint that obtains the highest
+score against the gold answer. This oracle is used only for analysis and is
+not available at inference time.
+
+Adding more candidate endpoints cannot reduce oracle performance, since the
+oracle can always retain the best previously available endpoint. Therefore,
+the improvement from the two-source to the three-source oracle indicates that
+the additional pathway is useful on some examples, but does not imply that a
+deployable router can always identify those examples.
+
+\begin{table}[h]
+\centering
+\caption{
+Number and percentage of examples for which each endpoint is selected by the
+gold-label oracle. Ties are resolved in the order E, GE, GH.
+}
+\begin{tabular}{lrrr}
+\toprule
+Task & E & GE & GH\\
+\midrule
+NQ &2,854 (79.08)&475 (13.16)&280 (7.76)\\
+WebQA &1,428 (70.28)&336 (16.54)&268 (13.19)\\
+TriviaQA &15,764 (87.85)&1,345 (7.50)&835 (4.65)\\
+TruthfulQA &361 (44.19)&254 (31.09)&202 (24.72)\\
+HotpotQA &6,150 (83.05)&762 (10.29)&493 (6.66)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+E is the most frequent oracle winner, although its count is increased by our
+tie-breaking rule: examples on which multiple endpoints receive the same score
+are assigned to E first. Importantly, these counts describe which complete
+endpoint performs best on each example; they are not routing frequencies of
+\textsc{MemoryAthena}. The deployed router mixes pathways locally across
+tokens and layers, so its average pathway weights measure a different quantity. This does not contradict the GH-dominated average routing weights reported
+elsewhere: the two statistics measure different quantities. Oracle counts
+identify the best complete endpoint per example, whereas routing weights measure
+the local contribution of each pathway within the deployed mixed trajectory.
+\section{Ablations and Architectural Controls}
+\label{app:ablations}
+
+Figure~\ref{fig:ablation-delta} summarizes the main architectural ablations
+relative to \textsc{MemoryAthena}. For open-QA tasks, we report F1; for
+TruthfulQA, we report the mean of the three multiple-choice metrics. Positive
+values indicate an improvement over the full system, and negative values
+indicate a degradation.
+
+\begin{figure}[h]
+    \centering
+    \safeincludegraphics[width=\columnwidth]
+    {../../figures/memoryathena_ablation_delta_heatmap.pdf}
+    \caption{
+    Performance changes relative to the full \textsc{MemoryAthena} system.
+    Open-QA tasks use F1 and TruthfulQA uses the mean multiple-choice score.
+    The final column reports the change in the five-task average.
+    }
+    \label{fig:ablation-delta}
+\end{figure}
+
+Removing the output gate causes the largest degradation among the
+memory-interface ablations, reducing the five-task average by 5.92 points.
+Replacing the learned interface with a parameter-matched FFN is substantially
+weaker, with an average drop of 14.36 points. The affine-stitch variant also
+underperforms the full system by 1.46 points on average.
+
+Permuting the memory keys has a comparatively small effect on the aggregate
+score, decreasing the five-task average by 0.70 points. In contrast, training
+the memory system from scratch reaches a slightly higher average than the
+pretrained-memory configuration (+0.89 points), with improvements on NQ,
+TriviaQA, TruthfulQA, and HotpotQA but a small decrease on WebQA.
+
+These results suggest that the learned memory interface and its gating
+mechanism are important for performance, whereas the advantage of the
+pretrained memory initialization is less consistent across the evaluated QA
+tasks.
+\section{Threshold Sensitivity}
+\label{app:classification}
+
+We study the sensitivity of the router to the advantage threshold $\tau$ on
+Yahoo Answers by varying $\tau$ while keeping the remaining inference
+configuration fixed. As shown in Table~\ref{tab:yahoo-threshold}, performance
+improves steadily as the threshold becomes more conservative, with the largest
+changes occurring between $\tau=0.3$ and $\tau=0.9$. Performance then largely
+stabilizes around $\tau=0.9$--$1.0$, indicating that routing behavior is
+sensitive to the admission threshold but becomes relatively stable in the
+high-threshold regime.
+
+\begin{table}[h]
+\centering
+\caption{
+Sensitivity of Yahoo Answers accuracy to the routing advantage threshold
+$\tau$ ($N=60{,}000$).
+}
+\label{tab:yahoo-threshold}
+\begin{tabular}{lr}
+\toprule
+Threshold $\tau$ & Accuracy (\%)\\
+\midrule
+0.00 & 45.8967\\
+0.05 & 46.1150\\
+0.10 & 46.2483\\
+0.20 & 47.0283\\
+0.30 & 48.3583\\
+0.90 & 57.3600\\
+1.00 & 57.4317\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These results show that the admission threshold can have a substantial effect
+on downstream classification performance. A larger $\tau$ makes the router
+more selective about when generated memory is allowed to intervene, suggesting
+that conservative routing is particularly important on Yahoo Answers.
+
+As an additional classification result, the router reaches 72.56\% accuracy on
+RTE, compared with 71.48\% for the E pathway, over 277 evaluation examples.
+\section{Interpreting Routing Statistics}
+\label{app:routing}
+
+\begin{table}[h]
+\centering
+\caption{
+Average interpolation mass on the validation corpora (\%). These values measure
+the contribution of each pathway to the injected residual and should not be
+interpreted as discrete source-selection frequencies.
+}
+\label{tab:routing-stats}
+\begin{tabular}{lrrr}
+\toprule
+Validation corpus & E & GE & GH\\
+\midrule
+Wikipedia-2021, QA checkpoint & 23.59 & 7.56 & 68.85\\
+General mixture, NLP checkpoint & 62.85 & 4.49 & 32.67\\
+Nemotron-CC-Code, coding checkpoint & 64.80 & 5.11 & 30.09\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:routing-stats} reports the average effective contribution of
+E, GE, and GH to the injected memory residual on the corresponding validation
+corpora. The statistic is averaged over token positions, layers, and batches.
+Because the deployed update has the form
+\[
+r=(1-\alpha)e+\alpha g,
+\]
+E retains a contribution of $1-\alpha$ even when a generated pathway is
+admitted. Thus, interpolation mass and source-selection frequency measure
+different aspects of the routing behavior.
+
+The QA checkpoint places most of its interpolation mass on GH, whereas the NLP
+and coding checkpoints retain substantially more mass on E. GE receives a
+smaller average contribution in all three settings. This variation suggests
+that the learned balance among the three pathways depends strongly on the
+training domain and checkpoint.
+
+For comparison, the calibration teacher stream records generated-pathway
+admission rates of 99.97\% for QA and 98.07\% for NLP. These high admission
+rates are compatible with non-trivial E mass because an admitted generated
+pathway can still be interpolated with E using $\alpha<1$. Admission rate and
+interpolation mass therefore should not be conflated.
+
+A more detailed downstream analysis could additionally report, for each task,
+the fraction of positions admitting GE or GH, the exact-E fallback rate, the
+conditional mean interpolation coefficient $\alpha$, and the resulting
+effective pathway weights.
+\section{Transfer and secondary evaluations}
+\label{app:transfer}
+
+\paragraph{Transfer.}
+Mistral-to-Llama QA scores are 29.98, 36.40, 67.39, 30.41, and 25.17. WebQA exceeds the source Mistral router, and the other four are lower. On six NLP tasks, the target router mean is 40.48 versus 38.23 for target E, with Yahoo at 10\%. These results demonstrate target-side adaptation only. A matched advantage over bare Llama would require its same-scorer baseline, which is missing (Appendix~\ref{app:transfer}).
+
+
+
+\begin{table}[h]
+\centering
+\caption{Target-Llama NLP accuracy (\%). Without matched bare-Llama scores, these compare target memory endpoints only.}
+\small
+\begin{tabular}{lrrrrrrr}
+\toprule
+Condition & SST2 & MR & CR & RT & AGN & Yahoo & Mean\\
+\midrule
+Target E &50.92&44.85&50.00&50.00&23.62&10.00&38.23\\
+Target router &49.08&47.95&58.35&52.44&25.05&10.00&40.48\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The router improves MR, CR, RT, and AGN, decreases SST2, and leaves Yahoo unchanged. Low absolute accuracies make these interface-transfer diagnostics rather than evidence of broadly successful NLP transfer. Without the bare target model, positive transfer and avoidance of negative transfer are not established.
+\begin{table}[h]
+\centering
+\caption{
+Performance on the HaluEval benchmark for question answering and summarization.
+Results report accuracy (\%). Small signed values denote percentage-point
+differences from Mistral-7B-v0.3. Average is the unweighted mean of QA and
+Summarization. RAG is not evaluated on summarization because this task requires
+only the source document.
+}
+\label{tab:halueval}
+\small
+\setlength{\tabcolsep}{6pt}
+
+\begin{tabular}{lrrr}
+\toprule
+Method
+& QA $\uparrow$
+& Summarization $\uparrow$
+& Average $\uparrow$\\
+\midrule
+
+\groupbar{4}{Reported baselines}
+
+Mistral-7B-v0.3
+& 53.99
+& 50.27
+& 52.13\\
+
+CPT
+& \scorechange{46.49}{-7.50}
+& \scorechange{47.39}{-2.88}
+& 46.94\\
+
+LoRA
+& \scorechange{50.02}{-3.97}
+& \scorechange{50.38}{+0.11}
+& 50.20\\
+
+RAG
+& \scorechange{65.09}{+11.10}
+& --
+& --\\
+
+MLP Memory
+& \scorechange{64.07}{+10.08}
+& \scorechange{52.41}{+2.14}
+& 58.24\\
+
+\midrule
+\groupbar{4}{This study}
+
+E only
+& \scorechange{50.12}{-3.87}
+& \scorechange{54.82}{+4.55}
+& 52.47\\
+
+\rowcolor{tablefocus}
+\textbf{\textsc{MemoryAthena}}
+& \scorechange{\textbf{49.54}}{-4.45}
+& \scorechange{\textbf{74.83}}{+24.56}
+& \textbf{62.19}\\
+
+\bottomrule
+\end{tabular}
+\end{table}
+HaluEval evaluates hallucination recognition \citep{li2023halueval}. Summarization improves by 20.01 points, while dialogue changes modestly and QA decreases. Confusion matrices and class-balance checks are needed before attributing the summarization gain to improved detection rather than response bias. Classification on this benchmark is not a direct measurement of hallucinations in free-form generation.
+\section{Scaling Analysis}
+\label{app:scaling}
+
+We study two complementary scaling dimensions:
+\emph{model scaling}, where the backbone and the complete memory-side system
+are enlarged jointly, and \emph{training-token scaling}, where the architecture
+is fixed and only the optimization budget is increased.
+We report only completed runs.
+
+\paragraph{Model-scaling setup.}
+We use GPT-2 Small, Medium, Large, and XL as the backbone family.
+As the backbone grows, the Engram table, generated-memory modules, readers,
+and routing head are scaled jointly rather than varying the memory table in
+isolation. Table~\ref{tab:scaling-config} summarizes the corresponding
+architectures and parameter counts.
+
+\begin{table}[t]
+\centering
+\caption{
+Model-scaling configurations. ``Gen.'' reports generator
+width/depth/number of generated latents. Memory-side total includes the Engram
+table, generated-memory modules, readers, and router, but excludes the backbone.
+}
+\label{tab:scaling-config}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+\textbf{Scale}
+& \textbf{Backbone}
+& \textbf{Engram}
+& \textbf{Gen.}
+& \textbf{Readers}
+& \textbf{Router}
+& \textbf{Memory-side} \\
+\midrule
+Small
+& 124M
+& 33.554M
+& 256/2/4
+& 16
+& 64
+& \textbf{37.573M} \\
+
+Medium
+& 345M
+& 93.716M
+& 428/2/6
+& 24
+& 104
+& \textbf{104.008M} \\
+
+Large
+& 774M
+& 209.715M
+& 640/3/8
+& 40
+& 160
+& \textbf{238.212M} \\
+
+XL
+& 1.5B
+& 405.537M
+& 896/4/12
+& 56
+& 224
+& \textbf{472.912M} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Engram addressing structure is kept fixed across scales, with maximum
+$n$-gram order 3 and four heads per order. Generator width increases from
+256 to 896, generator depth from 2 to 4 layers, the number of generated
+latents from 4 to 12, the source-adaptation rank from 16 to 56, and the router
+hidden width from 64 to 224. The resulting memory-side system grows from
+37.6M parameters with GPT-2 Small to 472.9M with GPT-2 XL.
+
+The routing head itself remains comparatively small. Its parameter count grows
+from approximately 0.054M, 0.119M, and 0.233M to 0.413M across the four scales,
+while most memory-side capacity is allocated to the Engram table and the
+generated-memory interface.
+
+\paragraph{Training procedure.}
+We consider two corpora for model scaling. The WikiText setting uses a maximum
+budget of 100M processed tokens per optimization stage, while the general-text
+mixture uses up to 600M tokens per stage.
+
+Training follows the same staged procedure as the main experiments.
+The memory is first learned with the source backbone fixed. The
+generated-memory modules and readers are then optimized while the backbone and
+memory table are fixed. Finally, these components are frozen and only the
+routing head is trained from E-relative advantage supervision.
+The no-memory results are obtained by directly evaluating the corresponding
+pretrained GPT-2 backbones and are used only as reference points.
+
+\paragraph{Model scaling.}
+Figure~\ref{fig:model-scaling} shows the completed model-scaling experiments.
+Across all completed runs, the same ordering is observed:
+\[
+\text{Router} < \text{Memory} < \text{No memory},
+\]
+where lower perplexity is better.
+
+\begin{figure}[t]
+    \centering
+
+    \begin{subfigure}[t]{0.50\linewidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_scaling_wikitext.pdf}
+        \caption{WikiText.}
+        \label{fig:scaling-wikitext}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.46\linewidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_scaling_general.pdf}
+        \caption{General-text mixture.}
+        \label{fig:scaling-general}
+    \end{subfigure}
+
+    \caption{
+    Model scaling across GPT-2 backbones. Lower perplexity is better.
+    The routed system consistently improves over the corresponding memory-only
+    configuration at every completed scale.
+    }
+    \label{fig:model-scaling}
+\end{figure}
+
+On WikiText, perplexity decreases from 30.841 to 24.033 to 23.372 for
+GPT-2 Small, from 22.569 to 17.797 to 17.291 for Medium, and from
+19.342 to 14.955 to 14.545 for Large, corresponding to the
+no-memory, memory-only, and routed systems.
+
+The completed general-mixture runs exhibit the same pattern. For GPT-2 Small,
+perplexity decreases from 36.752 to 32.300 and then to 31.772; for Medium,
+it decreases from 27.958 to 24.445 and then to 24.181.
+Thus, the routing benefit persists as the backbone and memory-side system are
+jointly scaled. The current results support persistence of the gain across
+scale rather than an increasing routing advantage with model size.
+
+\begin{table}[t]
+\centering
+\caption{
+Exact perplexities for the completed model-scaling runs.
+Lower is better.
+}
+\label{tab:model-scaling-values}
+\small
+\setlength{\tabcolsep}{7pt}
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+\textbf{Corpus}
+& \textbf{Scale}
+& \textbf{No memory}
+& \textbf{Memory}
+& \textbf{Router} \\
+\midrule
+WikiText
+& Small
+& 30.841
+& 24.033
+& \textbf{23.372} \\
+
+& Medium
+& 22.569
+& 17.797
+& \textbf{17.291} \\
+
+& Large
+& 19.342
+& 14.955
+& \textbf{14.545} \\
+
+\addlinespace[2pt]
+General mixture
+& Small
+& 36.752
+& 32.300
+& \textbf{31.772} \\
+
+& Medium
+& 27.958
+& 24.445
+& \textbf{24.181} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Training-token scaling.}
+We next isolate the effect of training budget while holding model capacity
+fixed. These experiments use GPT-2 XL with the same 405.5M-parameter Engram
+table and identical generator, reader, and router architectures. Only the
+number of processed training tokens per stage is varied.
+
+Figure~\ref{fig:token-param-scaling}a shows that increasing the training budget
+from 10M to 30M and 100M tokens monotonically reduces perplexity for both
+systems. Memory-only perplexity decreases from 20.714 to 20.369 and 19.783,
+while routed-memory perplexity decreases from 20.222 to 19.889 and 19.462.
+The routed model therefore remains better than memory alone at every completed
+training budget.
+
+Figure~\ref{fig:token-param-scaling}b provides the corresponding parameter
+breakdown across model scales. Most of the memory-side capacity is allocated
+to the Engram table, followed by the generated-memory modules and readers,
+while the routing head contributes only a small fraction of the total
+parameter count.
+
+\begin{figure}[t]
+    \centering
+
+    \begin{subfigure}[t]{0.45\linewidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_scaling_tokens.pdf}
+        \caption{Training-token scaling with GPT-2 XL fixed.}
+        \label{fig:scaling-tokens}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.50\linewidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_scaling_params.pdf}
+        \caption{Memory-side parameter scaling.}
+        \label{fig:scaling-params}
+    \end{subfigure}
+
+    \caption{
+    Training and capacity scaling. Left: increasing the per-stage training
+    budget improves both memory-only and routed systems while routing remains
+    consistently better. Right: breakdown of memory-side parameters as the
+    complete memory system is scaled with the backbone.
+    }
+    \label{fig:token-param-scaling}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\caption{
+Training-token scaling with the GPT-2 XL architecture fixed.
+Only the per-stage optimization budget changes.
+}
+\label{tab:token-scaling}
+\small
+\setlength{\tabcolsep}{10pt}
+\begin{tabular}{@{}rrr@{}}
+\toprule
+\textbf{Training budget}
+& \textbf{Memory}
+& \textbf{Router} \\
+\midrule
+10M
+& 20.714
+& \textbf{20.222} \\
+
+30M
+& 20.369
+& \textbf{19.889} \\
+
+100M
+& 19.783
+& \textbf{19.462} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Overall, the completed scaling experiments show two consistent trends.
+First, the benefit of adaptive routing is preserved as the backbone and
+memory-side architecture are jointly enlarged. Second, increasing the training
+budget improves both memory-only and routed systems, while the routing gain
+remains present throughout the evaluated range.
+
+\section{Case Study}
+\label{sec:case-study}
+
+Figure~\ref{fig:case-study} shows two representative downstream examples.
+In both cases, none of the standalone pathways ($E$, $GE$, or $GH$) yields the
+correct final answer, whereas \textsc{MemoryAthena} does.
+
+In the first example, the task is to identify which of two events occurred
+earlier.
+Although $GH$ receives most of the routed source mass, its standalone answer is
+still incorrect, while the routed system recovers the correct year, 1907.
+In the second example, the question asks for the winner of the 1992 Spengler
+Cup.
+The standalone outputs are either noisy or incomplete, but the routed system
+returns the exact answer, \textit{HC Davos}.
+These examples illustrate that the benefit of routing is not simply selecting
+the best single endpoint.
+Instead, \textsc{MemoryAthena} can exploit complementary information across
+memory pathways and transform imperfect endpoint predictions into a correct
+final answer.
+
+\begin{figure*}[t]
+    \centering
+    \safeincludegraphics[width=0.96\textwidth]{../../figures/memoryathena_case_studies.png}
+    \caption{
+    Two downstream case studies of \textsc{MemoryAthena}.
+    The routed system is correct in both examples although all individual
+    endpoints ($E$, $GE$, and $GH$) are incorrect.
+    The route traces show the effective source mass assigned to each pathway.
+    }
+    \label{fig:case-study}
+\end{figure*}
+
+
+\section{Computational Cost}
+\label{app:compute}
+
+We analyze the computational cost of \textsc{MemoryAthena} from two
+perspectives: the additional optimization required to learn the generated
+memory interface and routing policy, and the runtime overhead introduced during
+inference. The routing head itself is parameter-light, but the complete system
+must additionally evaluate generated-memory components and, in the current
+implementation, obtain clean causal backbone states for the GH pathway.
+
+\subsection{Training Cost}
+
+Training follows the three-stage procedure described in
+Appendix~\ref{app:training}. The memory is learned first, the generated-memory
+modules and readers are then optimized with the backbone and memory table
+frozen, and the final stage trains only the E-relative routing heads.
+
+The reader/generator stage contains approximately 167.4M trainable parameters,
+whereas the final router contains only 534,924 trainable parameters.
+Thus, the routing head accounts for only a small fraction of the trainable
+memory-interface parameters.
+
+\begin{table}[t]
+\centering
+\caption{
+Recorded wall-clock training time for the reader/generator and routing stages.
+The router contains 0.535M trainable parameters, compared with approximately
+167.4M in the reader/generator stage.
+}
+\label{tab:training-cost}
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}llrr@{}}
+\toprule
+\textbf{Setting}
+& \textbf{Stage}
+& \textbf{Trainable params.}
+& \textbf{Time (h)} \\
+\midrule
+QA
+& Reader / generator
+& 167.386M
+& 31.70 \\
+& Router
+& 0.535M
+& 11.19 \\
+\addlinespace
+
+General NLP
+& Reader / generator
+& 167.365M
+& 16.01 \\
+& Router
+& 0.535M
+& 10.58 \\
+\addlinespace
+
+Coding
+& Reader / generator
+& 167.365M
+& 16.41 \\
+& Router
+& 0.535M
+& 10.94 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The recorded reader/generator and router stages together take approximately
+42.89 hours for QA, 26.59 hours for general NLP, and 27.35 hours for coding.
+These numbers describe the recorded stages rather than the complete lifetime
+cost of the reusable source memory.
+
+Although only a small routing head is optimized in the final stage, routing
+training still requires non-trivial computation. Counterfactual supervision is
+constructed by evaluating multiple frozen endpoints under teacher forcing, and
+the GH pathway additionally requires clean backbone states. Consequently,
+trainable parameter count alone is not a direct measure of total training
+compute.
+
+\subsection{Inference Microbenchmark}
+
+We additionally benchmark the inference overhead of \textsc{MemoryAthena}
+relative to the direct E-only pathway across GPT-2 Small, Medium, Large, and XL.
+
+All measurements are performed on an AMD MI250X GPU using BF16 precision.
+Each run uses a fixed synthetic sequence of 338 input tokens and generates
+16 output tokens. We perform one warmup iteration followed by three measured
+iterations. We report end-to-end latency, total-token throughput, and peak
+reserved GPU memory.
+
+The E-only configuration executes the direct Engram pathway. In contrast,
+\textsc{MemoryAthena} additionally evaluates the generated-memory interface,
+routing features, and the clean causal backbone states required by GH in the
+current implementation.
+
+\begin{figure*}[t]
+    \centering
+
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_inference_latency.pdf}
+        \caption{End-to-end latency.}
+        \label{fig:compute-latency}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_inference_throughput.pdf}
+        \caption{Total-token throughput.}
+        \label{fig:compute-throughput}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \safeincludegraphics[width=\linewidth]
+        {../../figures/memoryathena_inference_memory.pdf}
+        \caption{Peak reserved GPU memory.}
+        \label{fig:compute-memory}
+    \end{subfigure}
+
+    \caption{
+    Inference microbenchmark on an AMD MI250X using BF16, with a fixed
+    338-token input and 16 generated tokens.
+    \textbf{Left:} latency, where annotations show the speed advantage of
+    E-only inference.
+    \textbf{Middle:} total-token throughput.
+    \textbf{Right:} peak reserved GPU memory, with annotations showing the
+    relative memory overhead of \textsc{MemoryAthena}.
+    The relative runtime and memory overhead decrease as the backbone scales.
+    }
+    \label{fig:compute-microbenchmark}
+\end{figure*}
+
+\paragraph{Latency and throughput.}
+E-only inference is faster at all four evaluated scales.
+For GPT-2 Small, latency increases from 146.7\,ms for E-only to 276.0\,ms for
+\textsc{MemoryAthena}, corresponding to a 1.88$\times$ speed advantage for
+E-only. The relative gap decreases with model size, to 1.50$\times$ for
+Medium, 1.43$\times$ for Large, and 1.40$\times$ for XL.
+
+The corresponding total-token throughput decreases from 2412.4 to
+1282.9 tokens/s at Small, from 1352.0 to 898.4 tokens/s at Medium, from
+942.7 to 658.4 tokens/s at Large, and from 702.6 to 500.7 tokens/s at XL.
+Thus, the absolute cost of both systems increases with model scale, while the
+relative overhead of the routed system becomes smaller.
+
+\paragraph{Memory overhead.}
+Peak reserved GPU memory increases from 0.57 to 0.93\,GiB at Small,
+1.60 to 2.28\,GiB at Medium, 3.63 to 4.90\,GiB at Large, and
+7.21 to 9.56\,GiB at XL.
+These correspond to relative overheads of approximately 63.2\%, 42.5\%,
+35.0\%, and 32.6\%, respectively.
+
+The memory results therefore exhibit the same qualitative trend as latency:
+although \textsc{MemoryAthena} requires additional runtime state, this
+additional cost represents a smaller fraction of the overall system footprint
+as the backbone becomes larger.
+
+\paragraph{Where does the overhead come from?}
+The additional cost should not be attributed primarily to the routing MLP.
+The routing head contains only 534,924 parameters. Instead, the main runtime
+overhead comes from evaluating the generated-memory pathways and maintaining
+their intermediate states. In particular, GH currently requires a separate
+memory-disabled backbone computation to obtain its clean causal conditioning
+states.
+
+This distinction is important: \textsc{MemoryAthena} is
+\emph{parameter-efficient} as a routing mechanism, but it is not a
+zero-overhead inference method.
+
+\paragraph{Scope of the benchmark.}
+The experiment is a controlled microbenchmark using a fixed synthetic prompt,
+generation length, precision, and hardware configuration. Its purpose is to
+measure relative systems overhead under matched conditions. The reported
+numbers should therefore not be interpreted as full downstream-task
+throughput, which can vary with sequence length, batch size, generation length,
+routing behavior, and hardware utilization.
+
+Overall, \textsc{MemoryAthena} trades additional computation for adaptive use
+of generated memory. The inference overhead is measurable at all evaluated
+scales, but its relative cost decreases with backbone size: the E-only latency
+advantage falls from 1.88$\times$ at Small to 1.40$\times$ at XL, while the
+reserved-memory overhead decreases from approximately 63\% to 33\%.
+\section{Language-model diagnostics and incomplete extensions}
+\label{app:secondary}
+
+\begin{table}[h]
+\centering
+\caption{General-NLP within-run validation perplexity. Endpoints and downstream accuracy need not rank identically.}
+\begin{tabular}{rrrr}
+\toprule
+E & GE & GH & Router\\
+\midrule
+9.07260&8.79091&8.78358&8.83063\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The NLP router improves E perplexity but not either generated endpoint. QA likewise records lower validation perplexity for ordinary soft fusion (7.07310) and hard routing (7.09269) than for the advantage router (7.14538), with E at 8.57136. Corpus perplexity alone does not establish better QA performance.
+
+\paragraph{Coding.}
+Completed Nemotron-CC-Code expert records give perplexities 3.10842 (E), 2.99503 (GE), and 2.98369 (GH), with arithmetic mean 3.02853. Routing records give 2.99563 after 19,998,720 input positions which is lower than tri-experts mean.

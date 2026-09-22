@@ -1,4 +1,4 @@
-# Offline MemoryAthena dashboard
+# MemoryATHENA project page
 
 Open `index.html` directly in a browser:
 
@@ -6,10 +6,14 @@ Open `index.html` directly in a browser:
 open web/index.html
 ```
 
-The page is a single static file. It has no CDN dependency, build step, or
-network request. Its information architecture follows the useful parts of the
-XMemTransfer README—method overview, result snapshot, reproduction map, and
-artifact layout—while using MemoryAthena's own data and terminology.
+The page is a single static file with no build step. Its layout follows the
+OLA Research XMemTransfer publication template: paper metadata, abstract,
+method narrative, research questions, key findings, resources, and BibTeX.
+It uses MemoryATHENA's own data, terminology, framework figure, and result
+tables while preserving the warm editorial typography of the reference page.
+
+The page loads Castoro and Inter from Google Fonts when online and falls back
+to Georgia and system sans-serif fonts when offline.
 
 The dashboard is a viewing aid. The authoritative evidence is the raw result
 JSON, completion marker, Slurm accounting record, and the paper source listed

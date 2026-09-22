@@ -171,13 +171,6 @@ No training token, private cluster path, or credential belongs in a public
 README. Raw logs, checkpoints, and job manifests remain outside the source
 checkout.
 
-## Offline dashboard
-
-Open [`web/index.html`](web/index.html) directly in a browser. It has no CDN,
-build step, or network dependency and presents the paper result map, scaling
-configuration, case-study status, and compute-cost job state. The dashboard is
-a local viewing aid, not a replacement for the raw JSON artifacts.
-
 ## GitHub stars
 
 [![GitHub stars](https://img.shields.io/github/stars/MJLee00/ATHENA?style=social)](https://github.com/MJLee00/ATHENA)

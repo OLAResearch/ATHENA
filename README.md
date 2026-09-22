@@ -42,6 +42,65 @@ The main Mistral configuration injects memory at layers 2 and 10 with a
 four-branch reader. The appendix reports the exact training budgets, routing
 thresholds, architecture, and checkpoint-selection rules.
 
+## Framework
+
+The framework has three complementary memory pathways: direct Engram retrieval
+(E), generation conditioned on Engram cues (GE), and generation conditioned on
+clean backbone hidden states (GH). A lightweight causal router predicts the
+relative advantage of the generated paths over E, admits a candidate only when
+it is useful and confident, and otherwise falls back exactly to E.
+
+[![MemoryAthena framework](figures/overview.png)](figures/overview.pdf)
+
+[Open the full framework figure as a PDF](figures/overview.pdf)
+
+## Main results
+
+The headline tables below reproduce the local paper-facing aggregates recorded
+by the experiment audit. The current evidence is single-seed (`seed=42`); no
+cross-seed error bars are claimed here.
+
+### Five-task open-domain QA
+
+Open-domain QA cells are `EM/F1` (%). TruthfulQA cells are
+`MC1/MC2/MC3/mean` (%).
+
+| Setting | NQ | WebQA | TriviaQA | TruthfulQA | HotpotQA |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Engram-only | 20.28/28.18 | 14.86/33.28 | 63.92/69.18 | 27.42/44.32/22.69/31.47 | 17.95/25.92 |
+| E-only path | 20.20/28.28 | 14.96/33.35 | 64.05/69.34 | 26.93/44.18/22.64/31.25 | 18.19/26.04 |
+| Three-source E-anchored router | **22.72/33.02** | **17.86/34.60** | 62.78/70.68 | **28.15/44.04/23.02/31.74** | 15.62/26.34 |
+| Mistral → Llama transfer | 20.37/29.98 | 18.06/36.40 | 60.35/67.39 | 27.78/41.57/21.87/30.41 | 16.00/25.17 |
+
+The standalone Engram-only row and the joint-checkpoint rows do not share every
+training detail, so this is an interface comparison rather than a
+compute-matched causal estimate. The router is strongest on NQ, WebQA, and
+TruthfulQA in this table; TriviaQA and HotpotQA remain useful diagnostics rather
+than universal wins.
+
+### Six-task general NLP
+
+All values are accuracy (%). E/router rows use the next-token synonym-sum dCPMI
+protocol; the historical Vanilla row uses a different full-choice scorer and
+is shown for traceability only.
+
+| Method | SST2 | MR | CR | RT | AGN | Yahoo | Average |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Vanilla Mistral † (historical scorer) | 81.08 | 75.60 | 74.00 | 74.67 | 73.24 | 55.03 | 72.27 |
+| Engram-only | 84.17 | 81.00 | 82.40 | 82.36 | 72.93 | 57.51 | 76.73 |
+| Three-source router ‡ (Yahoo τ=1.0) | **88.07** | **84.70** | **84.10** | **83.86** | **76.64** | 57.43 | **79.14** |
+| Router reference (all τ=0) | 88.07 | 84.70 | 84.10 | 83.86 | 76.64 | 45.91 | 77.22 |
+
+† Historical Vanilla and E/router scores are not a matched headline baseline.
+‡ The displayed 79.14 average uses the same router checkpoint with Yahoo
+threshold `τ=1.0` selected by a post-hoc test-set sweep; the other five tasks
+use `τ=0`. The all-`τ=0` row is retained to make the threshold sensitivity
+visible. Labels are used for final accuracy, not for memory, reader, or router
+training.
+
+For the full audit, protocol notes, ablations, transfer results, HaluEval, and
+the incomplete scaling evidence, see [`ARTIFACTS.md`](ARTIFACTS.md).
+
 ## Scaling configuration
 
 Scaling is joint model-side scaling, not only “make the memory table larger”:
@@ -118,6 +177,10 @@ Open [`web/index.html`](web/index.html) directly in a browser. It has no CDN,
 build step, or network dependency and presents the paper result map, scaling
 configuration, case-study status, and compute-cost job state. The dashboard is
 a local viewing aid, not a replacement for the raw JSON artifacts.
+
+## GitHub stars
+
+[![GitHub stars](https://img.shields.io/github/stars/MJLee00/ATHENA?style=social)](https://github.com/MJLee00/ATHENA)
 
 ## License
 

@@ -24,3 +24,9 @@ run/lumi/
 *.pdf
 figures/
 .DS_Store
+
+# Public README assets.
+!figures/
+figures/*
+!figures/overview.pdf
+!figures/overview.png

@@ -1,29 +1,114 @@
+% !TEX spellcheck = en_US
+
+% OLA Research article/preprint template, adapted for the MemoryATHENA paper.
+\pdfminorversion=7
 \documentclass{article}
 \usepackage[T1]{fontenc}
-\usepackage[margin=1in]{geometry}
-\usepackage{times}
-\usepackage{natbib}
-\usepackage{microtype}
-\usepackage{amsmath,amssymb,mathtools}
+\usepackage[margin=2.8cm]{geometry}
+\geometry{a4paper}
+
+% Core graphics, tables, and text utilities from the OLA template.
+\usepackage{graphicx}
+\usepackage{picinpar}
 \usepackage{subcaption}
-\usepackage{booktabs,array,graphicx}
-\usepackage[section]{placeins}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{soul}
+\usepackage{enumerate}
+\usepackage{tabularx}
+
+% Math and algorithms.  The paper uses algorithm2e syntax for its existing
+% routing algorithm, while retaining algpseudocode for template compatibility.
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
 \usepackage{algpseudocode}
 \usepackage[ruled,vlined]{algorithm2e}
-\usepackage{tabularx}
-\usepackage{xcolor,colortbl}
-\definecolor{algblue}{RGB}{38,100,180}
-\definecolor{algred}{RGB}{190,55,55}
+
+% Fonts, bibliography, cross-references, branding, and spacing.
 \usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{kpfonts}
+\usepackage{natbib}
+\usepackage{tcolorbox}
+\usepackage{fontawesome5}
+\usepackage{xspace}
+\usepackage{microtype}
 \usepackage{url}
+\usepackage[section]{placeins}
+\usepackage{authblk}
+\setcounter{Maxaffil}{2}
+\renewcommand\Affilfont{\small}
+
+% Running header and OLA/ELLIS preprint branding.
+\usepackage{fancyhdr}
+\setlength{\headheight}{18pt}
+\fancypagestyle{firstpage}{%
+  \fancyhead[L]{\raisebox{0.05\height}{\hypersetup{hidelinks}\href{https://www.olaresearch.org/}{\includegraphics[height=1.2em]{logo/olaresearch.png}}}~Preprint}%
+  \fancyhead[R]{\raisebox{0.05\height}{\hypersetup{hidelinks}\href{https://www.ellisinstitute.fi}{\usebox{\ellislogo}}}}%
+}
+\newsavebox{\ellislogo}
+\sbox{\ellislogo}{\includegraphics[height=1em]{logo/ellis-logo_horizontal_black_2023-FINLAND.png}}
+\bibliographystyle{abbrvnat}
+
+% OLA Research brand palette.
+\definecolor{colornavy}{HTML}{1B365D}
+\definecolor{coloramber}{HTML}{E0913A}
+\definecolor{colormint}{HTML}{004A43}
+\definecolor{colorblue}{HTML}{1D70B8}
+\definecolor{colorforest}{HTML}{194D33}
+\definecolor{colorslate}{HTML}{475569}
 \hypersetup{
-  colorlinks=true,
-  linkcolor=blue!55!black,
-  citecolor=blue!55!black,
-  urlcolor=blue!55!black,
+  colorlinks=false,
+  pdfborder={0 0 1},
+  linkbordercolor=colornavy,
+  citebordercolor=colorforest,
+  urlbordercolor=colorblue,
   pdftitle={MemoryAthena: Adaptive Routing over Latent and Generated Memories},
   pdfauthor={Anonymous authors}
 }
+
+\setcitestyle{round, elide, numbers}
+
+% Branded abstract card from the OLA article template, with this project's
+% verified public resources.
+\renewenvironment{abstract}{%
+  \begin{tcolorbox}[
+    colback=colornavy!4,
+    colframe=colornavy,
+    leftrule=4pt,
+    rightrule=0.5pt,
+    toprule=0.5pt,
+    bottomrule=0.5pt,
+    arc=3pt,
+    boxsep=5pt,
+    left=12pt,
+    right=12pt,
+    top=10pt,
+    bottom=10pt,
+    title=\textbf{Abstract},
+    coltitle=colormint,
+    attach title to upper,
+    after title={\par\medskip}
+  ]%
+}{%
+  \medskip{\color{colornavy}\hrule height 0.5pt}\medskip
+  \small\noindent
+  {\hypersetup{hidelinks}%
+  \begin{tabular}{@{}l@{\hspace{0.5em}}l@{}}
+    \makebox[1.15em][c]{\textcolor{colormint}{\faGlobe}} & \textbf{Project page:} \href{https://github.com/MJLee00/ATHENA/tree/main/web}{\textit{MemoryATHENA web source}} \\
+    \makebox[1.15em][c]{\textcolor{colormint}{\faGithub}} & \textbf{GitHub code:} \href{https://github.com/MJLee00/ATHENA}{\textit{github.com/MJLee00/ATHENA}} \\
+    \makebox[1.15em][c]{\raisebox{-0.12\height}{\includegraphics[height=1.2em]{logo/huggingface.pdf}}} & \textbf{Hugging Face models:} \href{https://huggingface.co/collections/OLAResearchX/memoryathena}{\textit{MemoryATHENA collection}} \\
+    \makebox[1.15em][c]{\textcolor{colormint}{\faDatabase}} & \textbf{Hugging Face dataset:} \href{https://huggingface.co/datasets/OLAResearchX/MemoryATHENA}{\textit{MemoryATHENA results}}
+  \end{tabular}%
+  }
+  \end{tcolorbox}%
+}
+
+% Toggle this on for a line-numbered review copy.
+\usepackage[]{lineno}
 
 % The repository currently contains the framework figure but not every derived
 % result figure referenced by the paper.  Keep the source compilable and make
@@ -64,6 +149,8 @@
 \date{}
 \begin{document}
 \maketitle
+\thispagestyle{firstpage}
+% \linenumbers
 \begin{abstract}
 Learned-memory methods store information in an explicit table and consume it through a separate reader, allowing addressing, storage, and reading to be modified independently. Prior work on cross-model memory transfer exploits this separation to reuse learned memory across frozen backbones through an adapted reader, while the representation consumed by the model still originates from stored memory. This raises a natural question: must useful memory always be
 retrieved from storage, or can it also be generated?
@@ -74,12 +161,6 @@ We investigate this question with \textsc{MemoryAthena}, a memory interface with
 On question answering, \method{} raises the five-task average from 37.65 to 39.28 over the direct pathway of the same checkpoint, while the six-task general-NLP average increases from 76.73 to 79.13. The complete memory-side system contains approximately 201M parameters, excluding the frozen backbone. Further analyses show that the utility of E, GE, and GH varies across tasks and inputs, while gold-label oracles reveal additional complementarity among the three pathways. These results support generated memory as a selective correction to direct retrieval rather than a universal replacement, and highlight routing when, which, and how strongly to intervene as the central
 challenge.
 \end{abstract}
-\noindent\textbf{Open-source resources.}
-\href{https://github.com/MJLee00/ATHENA}{Code},
-\href{https://huggingface.co/collections/OLAResearchX/memoryathena}{models},
-\href{https://huggingface.co/datasets/OLAResearchX/MemoryATHENA}{dataset}, and
-\href{https://github.com/MJLee00/ATHENA/tree/main/web}{project page}.
-\medskip
 \section{Introduction}
 
 Retrieval-augmented generation supplies a language model with external text
@@ -1113,7 +1194,6 @@ The appendices specify every pathway, freezing boundary, objective, admission ru
 An AI assistant assisted drafting, organization, and consistency checks against experiment records. The claims, experimental validity, and final submission remain the authors' responsibility.
 
 \bibliography{memoryathena_references}
-\bibliographystyle{plainnat}
 \clearpage
 \appendix
 

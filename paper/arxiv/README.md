@@ -1,11 +1,12 @@
 # MemoryATHENA arXiv source
 
 This directory is a standalone arXiv-oriented derivative of the current paper
-source in `paper/ICLR_submit.tex`. It keeps the existing claims, equations,
-tables, appendix, and bibliography, while replacing the ICLR style dependency
-with a conventional one-column article layout. The public resource links are
-included near the abstract, following the project-page resource structure used
-by the OLA Research template.
+source in `paper/ICLR_submit.tex`, rebuilt on the article template from
+<https://github.com/OLAResearch/latex-template>. It keeps the existing claims,
+equations, tables, appendix, and bibliography, while using the template's A4
+layout, KPFonts, branded OLA/ELLIS header, abstract card, author block, and
+cross-reference setup. The public resource links are included in the abstract
+card.
 
 ## Resources
 
@@ -21,10 +22,12 @@ paths resolve correctly:
 
 ```bash
 cd paper/arxiv
-latexmk -pdf -interaction=nonstopmode MemoryATHENA_arxiv.tex
+latexmk -pdf -interaction=nonstopmode main.tex
 ```
 
 The current repository snapshot includes the framework figure but not all
 derived result-figure PDFs referenced by the paper. Missing figures are
 rendered as explicit source-snapshot notices by `\safeincludegraphics`; adding
 the corresponding files under `figures/` makes them appear automatically.
+The `logo/` directory contains the branding assets required by the OLA
+template.
